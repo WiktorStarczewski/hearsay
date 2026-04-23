@@ -4,6 +4,21 @@ Read a teammate's Claude Code session transcripts over an MCP bridge.
 
 When a teammate (Ivan, Peter, ...) reports "my Claude did X and Y," you don't want to human-relay follow-up questions. `hearsay` runs on their machine, exposes their `~/.claude/projects/` over an authenticated MCP endpoint, and your Claude reads the transcript directly. No relay, no paraphrase — primary evidence.
 
+## Prerequisites
+
+Both sides — the teammate running the server and the reader consuming it — need:
+
+- **[Go](https://go.dev/dl/) ≥ 1.25** — `brew install go` on macOS. Required to `go install` the binary.
+- **[Claude Code](https://claude.com/claude-code)** — the whole point is bridging two Claude Code sessions. Teammates need it running so there's something to read; readers need it to consume the MCP tools. Install via `npm install -g @anthropic-ai/claude-code` or see the official docs.
+
+For anything beyond loopback (reader and server on the same machine), you also need a network path between the two machines:
+
+- **[Tailscale](https://tailscale.com/download)** (recommended) — both machines join a shared tailnet; `hearsay` auto-detects the Tailscale IPv4 and binds there. Zero public exposure, no cert setup, and the tailnet is WireGuard-encrypted so plain HTTP is fine. Install: `brew install --cask tailscale`.
+- **[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)** (alternative) — `cloudflared tunnel --url http://localhost:3456` gives a public HTTPS URL. The bearer token is the only access control; consider stacking Cloudflare Access for IP allowlisting.
+- **Loopback only** — if you just want to test against your own sessions without any network, skip both. `--bind 127.0.0.1` keeps the server private to the host.
+
+**Platform support:** macOS is the primary target (the `brew install` commands assume it). Linux should work — the config path falls back to `$XDG_CONFIG_HOME/hearsay` (default `~/.config/hearsay`). Windows is untested.
+
 ## Install
 
 ```bash
