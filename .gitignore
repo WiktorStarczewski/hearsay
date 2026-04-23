@@ -1,0 +1,5 @@
+/dist/
+hearsay
+*.test
+*.out
+.DS_Store
