@@ -1,0 +1,59 @@
+name: ci
+
+# Runs on every pull request targeting main and on pushes to main (so
+# the branch-protection status check has a baseline history once it's
+# enabled). The coverage gate fails the job if aggregate line coverage
+# across all packages drops below 90%.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Reads go 1.X from go.mod; keeps CI in lockstep with the
+          # toolchain the repo declares rather than hard-coding a
+          # version here.
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test with coverage
+        # -coverpkg=./... aggregates hits from every package into the
+        # same profile so the total % matches what `go tool cover -func`
+        # prints locally. -race catches data races in our HTTP/goroutine
+        # paths (server, signal handling).
+        run: go test -race -coverpkg=./... -coverprofile=coverage.out ./...
+
+      - name: Enforce 90% coverage
+        run: |
+          set -euo pipefail
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d '%')
+          echo "Aggregate coverage: ${total}%"
+          awk -v t="$total" 'BEGIN { if (t + 0 < 90) { print "FAIL: coverage " t "% is below the 90% threshold"; exit 1 } }'
+
+      - name: Upload coverage profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 14
