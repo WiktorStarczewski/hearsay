@@ -80,9 +80,11 @@ func buildResolution(jsonlPath, agentID string) *SubagentResolution {
 }
 
 // sidecarPathRegex matches the absolute path a tool_result block embeds
-// when Claude Code stores the result out-of-line. Example match:
+// when Claude Code stores the result out-of-line. The leading \S+ (greedy)
+// grabs the full absolute path preceding /tool-results/, so the
+// matched string is directly openable by os.ReadFile. Example match:
 //   /Users/.../projects/-Users-x-y/<sessionId>/tool-results/b1nml93nh.txt
-var sidecarPathRegex = regexp.MustCompile(`/tool-results/[A-Za-z0-9_-]+\.txt`)
+var sidecarPathRegex = regexp.MustCompile(`/\S+/tool-results/[A-Za-z0-9_-]+\.txt`)
 
 // ToolResultLocationKind discriminates sidecar-file vs inline content.
 type ToolResultLocationKind int

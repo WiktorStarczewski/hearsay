@@ -26,12 +26,18 @@ type Config struct {
 // ~/Library/Application Support/hearsay; Linux honors $XDG_CONFIG_HOME
 // (falling back to ~/.config/hearsay).
 func Dir() string {
+	return dirFor(runtime.GOOS, os.Getenv("XDG_CONFIG_HOME"))
+}
+
+// dirFor is the testable core of Dir — factored out so both platform
+// branches are exercisable without cross-compilation tricks.
+func dirFor(goos, xdgConfigHome string) string {
 	home, _ := os.UserHomeDir()
-	if runtime.GOOS == "darwin" {
+	if goos == "darwin" {
 		return filepath.Join(home, "Library", "Application Support", "hearsay")
 	}
-	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
-		return filepath.Join(xdg, "hearsay")
+	if xdgConfigHome != "" {
+		return filepath.Join(xdgConfigHome, "hearsay")
 	}
 	return filepath.Join(home, ".config", "hearsay")
 }
