@@ -1,5 +1,8 @@
 # hearsay
 
+[![ci](https://github.com/WiktorStarczewski/hearsay/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/WiktorStarczewski/hearsay/actions/workflows/ci.yml?query=branch%3Amain)
+[![coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/WiktorStarczewski/hearsay/badges/coverage.json)](https://github.com/WiktorStarczewski/hearsay/actions/workflows/ci.yml?query=branch%3Amain)
+
 Read a teammate's Claude Code session transcripts over an MCP bridge.
 
 When a teammate (Ivan, Peter, ...) reports "my Claude did X and Y," you don't want to human-relay follow-up questions. `hearsay` runs on their machine, exposes their `~/.claude/projects/` over an authenticated MCP endpoint, and your Claude reads the transcript directly. No relay, no paraphrase — primary evidence.

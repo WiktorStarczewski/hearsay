@@ -4,6 +4,11 @@ name: ci
 # the branch-protection status check has a baseline history once it's
 # enabled). The coverage gate fails the job if aggregate line coverage
 # across all packages drops below 90%.
+#
+# After a green push to main, a second job refreshes the shields.io
+# endpoint JSON used by the coverage badge in README.md. It publishes
+# to a dedicated `badges` branch so that branch-protection on main
+# remains intact — the bot never writes to main directly.
 on:
   pull_request:
     branches: [main]
@@ -57,3 +62,64 @@ jobs:
           name: coverage
           path: coverage.out
           retention-days: 14
+
+  # Publish the coverage percentage to a JSON file on the `badges` branch
+  # so shields.io can render a live badge in README.md. Only runs after a
+  # green push to main. The badges branch is an orphan, containing only
+  # the endpoint JSON — nothing merges back into main.
+  badge:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Compose shields.io endpoint JSON
+        id: badge
+        run: |
+          set -euo pipefail
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d '%')
+          int=$(printf '%.0f' "$total")
+          color=red
+          if [ "$int" -ge 80 ]; then color=yellow; fi
+          if [ "$int" -ge 90 ]; then color=brightgreen; fi
+          if [ "$int" -ge 95 ]; then color=green; fi
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$total" "$color" > /tmp/coverage.json
+          echo "pct=${total}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to `badges` branch
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Either check out an existing `badges` branch or create it
+          # as an orphan. The orphan contents are scrubbed so the branch
+          # never accumulates anything beyond what we publish.
+          if git ls-remote --exit-code --heads origin badges > /dev/null 2>&1; then
+            git fetch origin badges
+            git checkout badges
+          else
+            git checkout --orphan badges
+            git rm -rf . > /dev/null 2>&1 || true
+          fi
+
+          cp /tmp/coverage.json coverage.json
+          git add coverage.json
+
+          if git diff --cached --quiet; then
+            echo "Badge JSON unchanged"
+          else
+            git commit -m "chore: coverage badge → ${{ steps.badge.outputs.pct }}%"
+            git push origin badges
+          fi
