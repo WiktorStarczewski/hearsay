@@ -60,7 +60,17 @@ const consumerBlockBody = `## hearsay — reading my teammates' Claude Code sess
 
 Several of my teammates run ` + "`hearsay`" + ` MCP servers that expose their Claude Code session transcripts. Each server is labelled with the teammate's first name in my MCP config. When I mention a teammate by name, route to the correspondingly-named tools (` + "`mcp__<name>__*`" + `). For "what's <name> doing right now?", prefer ` + "`get_current_session`" + ` — it carries its own ambiguity contract in the tool description.
 
-Don't relay questions through me — read the source transcript.`
+Don't relay questions through me — read the source transcript.
+
+### Registering a new peer
+
+When I say "install the hearsay mcp server for <name> at <url> with token <token>" (or I paste those three fields in any form), run:
+
+` + "```bash" + `
+hearsay add-peer <name> --url <url> --token <token>
+` + "```" + `
+
+Then tell me to restart Claude Code (or run /mcp) to see the new server's tools. To un-register a peer later, run ` + "`hearsay remove-peer <name>`" + `.`
 
 const peerBlockBody = `## hearsay — sharing session IDs with Wiktor
 

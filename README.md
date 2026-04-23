@@ -39,7 +39,23 @@ By default the server binds to the machine's Tailscale IPv4 address (via `tailsc
 
 ## Connect (consumer side, e.g. Wiktor's Claude Code)
 
-Add an entry to `~/.claude.json` under `mcpServers`, one per teammate:
+One command registers a teammate's hearsay server with your Claude Code MCP config:
+
+```bash
+hearsay add-peer ivan --url http://ivan-mac.tailXXXX.ts.net:3456/mcp --token <token-ivan-sent-you>
+```
+
+This shells out to `claude mcp add --scope user` and writes the right `mcpServers` entry in `~/.claude.json`. Restart Claude Code — `/mcp` should list `ivan` with 8 tools.
+
+To un-register: `hearsay remove-peer ivan`.
+
+**Install via a Claude prompt.** If you've installed the consumer CLAUDE.md block (see the next section), you can also just tell your Claude:
+
+> install the hearsay mcp server for ivan at http://ivan-mac.tailXXXX.ts.net:3456/mcp with token abc123...
+
+Claude will parse the three fields out of your message, run `hearsay add-peer` for you, and tell you to restart.
+
+**Manual alternative.** If you'd rather edit the config yourself, add this under `mcpServers` in `~/.claude.json`:
 
 ```json
 {
@@ -48,20 +64,12 @@ Add an entry to `~/.claude.json` under `mcpServers`, one per teammate:
       "type": "http",
       "url": "http://ivan-mac.tailXXXX.ts.net:3456/mcp",
       "headers": {
-        "Authorization": "Bearer ${IVAN_HEARSAY_TOKEN}"
+        "Authorization": "Bearer <token-ivan-sent-you>"
       }
     }
   }
 }
 ```
-
-Export the token:
-
-```bash
-export IVAN_HEARSAY_TOKEN=<token-ivan-sent-you>
-```
-
-Restart Claude Code. `/mcp` should list `ivan` with 8 tools.
 
 ## Tools
 
