@@ -39,23 +39,45 @@ By default the server binds to the machine's Tailscale IPv4 address (via `tailsc
 
 ## Connect (consumer side, e.g. Wiktor's Claude Code)
 
-One command registers a teammate's hearsay server with your Claude Code MCP config:
+Preferred flow: Ivan generates a one-line invite, Wiktor pairs against it.
+
+**On Ivan's machine** (once his server is running):
 
 ```bash
-hearsay add-peer ivan --url http://ivan-mac.tailXXXX.ts.net:3456/mcp --token <token-ivan-sent-you>
+hearsay invite
+# → hearsay://ivan@ivan-mac.tailXXXX.ts.net:3456/mcp?token=abc123...
 ```
 
-This shells out to `claude mcp add --scope user` and writes the right `mcpServers` entry in `~/.claude.json`. Restart Claude Code — `/mcp` should list `ivan` with 8 tools.
+Ivan sends that line to Wiktor over a secret channel (1Password, Signal). When Tailscale is running, the host is auto-detected from MagicDNS; otherwise pass `--host <hostname>`.
 
-To un-register: `hearsay remove-peer ivan`.
+**On Wiktor's machine**:
 
-**Install via a Claude prompt.** If you've installed the consumer CLAUDE.md block (see the next section), you can also just tell your Claude:
+```bash
+hearsay pair hearsay://ivan@ivan-mac.tailXXXX.ts.net:3456/mcp?token=abc123...
+```
+
+That's it — `pair` writes the `mcpServers` entry into `~/.claude.json` via `claude mcp add --scope user`. Restart Claude Code; `/mcp` should list `ivan` with 8 tools.
+
+### Install via a Claude prompt
+
+If you've installed the consumer CLAUDE.md block (see the next section), you can skip the CLI entirely:
+
+> install this hearsay invite: hearsay://ivan@ivan-mac.tailXXXX.ts.net:3456/mcp?token=abc123...
+
+Or, if you still have raw fields:
 
 > install the hearsay mcp server for ivan at http://ivan-mac.tailXXXX.ts.net:3456/mcp with token abc123...
 
-Claude will parse the three fields out of your message, run `hearsay add-peer` for you, and tell you to restart.
+Claude parses either form and runs `hearsay pair` / `hearsay add-peer`.
 
-**Manual alternative.** If you'd rather edit the config yourself, add this under `mcpServers` in `~/.claude.json`:
+### Other consumer commands
+
+- `hearsay add-peer ivan --url <url> --token <token>` — the three-field form, if you don't have an invite URI.
+- `hearsay remove-peer ivan` — un-register a peer.
+
+### Manual alternative
+
+If you'd rather edit the config yourself, add this under `mcpServers` in `~/.claude.json`:
 
 ```json
 {

@@ -64,13 +64,19 @@ Don't relay questions through me — read the source transcript.
 
 ### Registering a new peer
 
-When I say "install the hearsay mcp server for <name> at <url> with token <token>" (or I paste those three fields in any form), run:
+**Preferred — one-URI invite.** When I paste a ` + "`hearsay://`" + ` URI (e.g. "install this hearsay invite: hearsay://ivan@ivan-mac.tail1234.ts.net:3456/mcp?token=abc"), run:
+
+` + "```bash" + `
+hearsay pair <uri>
+` + "```" + `
+
+**Fallback — explicit fields.** When I say "install the hearsay mcp server for <name> at <url> with token <token>", run:
 
 ` + "```bash" + `
 hearsay add-peer <name> --url <url> --token <token>
 ` + "```" + `
 
-Then tell me to restart Claude Code (or run /mcp) to see the new server's tools. To un-register a peer later, run ` + "`hearsay remove-peer <name>`" + `.`
+Either way, tell me afterwards to restart Claude Code (or run /mcp) to see the new server's tools. To un-register a peer later, run ` + "`hearsay remove-peer <name>`" + `.`
 
 const peerBlockBody = `## hearsay — sharing session IDs with Wiktor
 
