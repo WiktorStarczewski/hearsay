@@ -141,13 +141,8 @@ Server flags:
 
 ## Design notes
 
-Read the full plan at `/Users/celrisen/.claude/plans/lets-prototype-the-transcript-reader-toasty-cake.md` (same repo at some point — currently a standalone plan file). Key decisions the plan documents:
-
 - Each `hearsay` instance is named (`--name ivan`). The name is baked into every tool description at registration time, so Claude Code's natural routing (user mentions "Ivan" → `mcp__ivan__*` tools) works without any consumer-side config.
 - `get_current_session` returns an explicit `ambiguous` field rather than silently picking among multiple live sessions. The tool description tells the calling Claude to ASK the user when ambiguous.
 - The JSONL parser tolerates truncated last lines (active sessions mid-write) and unknown event types (forward-compat).
 - Tool-result sidecar paths are extracted by regex from the inline message content — the sidecar filename is *not* the `tool_use.id`.
 
-## Out of scope
-
-This is a read-only prototype. Out of scope: redaction, write-back/interactive Q&A to the remote Claude, cross-session search, signed release binaries.
