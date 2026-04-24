@@ -567,7 +567,24 @@ func TestRunServer_BadFlagArgs(t *testing.T) {
 func TestRunServer_FirstRunWithoutNameErrors(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	if code := runServerWithSignals([]string{"--bind", "127.0.0.1"}, nil); code != 1 {
+	// Neutralize any inherited XDG_CONFIG_HOME so Dir() resolves strictly
+	// under the scratch HOME. Without this, some CI images leave
+	// XDG_CONFIG_HOME set to a populated path and Resolve finds a
+	// pre-existing config there — the server then boots for real and,
+	// with a nil signal channel, the test hangs on `<-nil`.
+	t.Setenv("XDG_CONFIG_HOME", "")
+	// Belt-and-suspenders: pre-signal the channel so that if the
+	// no-name→error path ever regresses, the server shuts down instead
+	// of hanging the test for 10 minutes.
+	sigCh := make(chan os.Signal, 1)
+	sigCh <- syscall.SIGTERM
+	// Pick an ephemeral port so the default :3456 doesn't collide with
+	// other tests running in parallel on the same runner.
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	args := []string{"--bind", "127.0.0.1", "--port", fmt.Sprint(port), "--data-dir", t.TempDir(), "--quiet"}
+	if code := runServerWithSignals(args, sigCh); code != 1 {
 		t.Errorf("expected exit=1 when --name is missing on first run, got %d", code)
 	}
 }
