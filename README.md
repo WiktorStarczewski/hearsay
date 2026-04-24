@@ -16,11 +16,76 @@ Both sides — the teammate running the server and the reader consuming it — n
 
 For anything beyond loopback (reader and server on the same machine), you also need a network path between the two machines:
 
-- **[Tailscale](https://tailscale.com/download)** (recommended) — both machines join a shared tailnet; `hearsay` auto-detects the Tailscale IPv4 and binds there. Zero public exposure, no cert setup, and the tailnet is WireGuard-encrypted so plain HTTP is fine. Install: `brew install --cask tailscale`.
+- **[Tailscale](https://tailscale.com/download)** (recommended) — each side has Tailscale installed; traffic rides the WireGuard-encrypted tailnet so plain HTTP on `:3456` is fine. In the common case each person has their own personal or org tailnet and the sender **shares** their hearsay-hosting node with the receiver — no shared-tailnet membership required. See [Tailscale setup](#tailscale-setup) below for the step-by-step. Install: `brew install --cask tailscale`.
 - **[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)** (alternative) — `cloudflared tunnel --url http://localhost:3456` gives a public HTTPS URL. The bearer token is the only access control; consider stacking Cloudflare Access for IP allowlisting.
 - **Loopback only** — if you just want to test against your own sessions without any network, skip both. `--bind 127.0.0.1` keeps the server private to the host.
 
 **Platform support:** macOS is the primary target (the `brew install` commands assume it). Linux should work — the config path falls back to `$XDG_CONFIG_HOME/hearsay` (default `~/.config/hearsay`). Windows is untested.
+
+## Tailscale setup
+
+Both sides need Tailscale on their machine and a network path between them. The usual shape: **each person runs their own tailnet, and the hearsay-hosting side uses Tailscale's *node sharing* to let the receiver reach them.** You never have to join someone else's tailnet.
+
+### 1. Install Tailscale (per machine, one-time)
+
+**macOS:**
+```bash
+brew install --cask tailscale
+```
+
+This installs `Tailscale.app`. Other platforms: https://tailscale.com/download.
+
+### 2. Approve the Network Extension (macOS only, easy to miss)
+
+Open the Tailscale app. On first launch macOS needs you to approve a system network extension — do this in:
+
+- **System Settings → General → Login Items & Extensions → Network Extensions** (macOS 15+), or
+- **System Settings → Privacy & Security** (older macOS — scroll to the pending prompt).
+
+Toggle **Tailscale Network Extension** on. Without this step the app will spin forever, `tailscaled` never comes up, and your Tailscale admin panel will show *"waiting for your first device."* Check with:
+
+```bash
+systemextensionsctl list | grep tailscale
+# you want: [activated enabled]  (NOT [activated waiting for user])
+```
+
+### 3. Sign in
+
+In the Tailscale app, sign in (or create a free account). You get your own tailnet with a suffix like `tail046457.ts.net` and your machine is assigned a MagicDNS hostname. Confirm:
+
+```bash
+tailscale status --self --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["Self"]["DNSName"].rstrip("."))'
+```
+
+That hostname is what `hearsay invite` embeds when you run it — no additional config.
+
+### 4. (Hearsay peer side) Run hearsay
+
+Nothing special — by default `hearsay --name <you>` binds to your Tailscale interface IPv4 so only tailnet traffic can hit it. `hearsay invite` auto-detects your MagicDNS hostname and stamps it into the invite URI.
+
+### 5. (Hearsay consumer side) Accept a node share
+
+When someone sends you an invite URI (`hearsay://.../*.ts.net:3456/...`) and you're **not** already on their tailnet, they need to share their hearsay-hosting node with you:
+
+- **You:** send them the email address you used to sign into Tailscale. Find it with:
+  ```bash
+  tailscale status --self --json | python3 -c 'import json,sys; d=json.load(sys.stdin); self=d["Self"]; print(d["User"][str(self["UserID"])]["LoginName"])'
+  ```
+- **Sender:** opens the Tailscale admin at https://login.tailscale.com/admin/machines, clicks `…` → **Share…** on their hearsay-hosting node, and pastes your email.
+- **You:** get an email and an in-app notification. Accept it. The shared node shows up under **"Machines — shared with you"** in your Tailscale app.
+
+### 6. Verify reachability before pairing
+
+```bash
+curl -I http://<their-hostname>.<their-tailnet>.ts.net:3456/health
+# HTTP/1.1 200 OK  (unauthenticated probe — tunnel / reverse-proxy friendly)
+```
+
+If that responds, `hearsay pair <uri>` will succeed. If it hangs or gives a timeout, the share hasn't been accepted / propagated yet.
+
+### Multiple peers on different tailnets
+
+You can accept shares from any number of teammates. Each stays on their own tailnet suffix (`ivan-mac.tailAAAA.ts.net`, `peter-mbp.tailBBBB.ts.net`, ...) and each appears as a separate `mcpServers` entry in your `~/.claude.json`. You only ever maintain one Tailscale client on one tailnet.
 
 ## Install
 
