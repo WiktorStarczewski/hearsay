@@ -1,5 +1,9 @@
 /dist/
-hearsay
+# Anchor the binary-ignore to the repo root so `cmd/hearsay/` (the
+# source directory) isn't matched by this rule. Without the leading
+# slash, git treats every path component called `hearsay` as ignored —
+# which silently dropped cmd/hearsay/*.go out of history for a while.
+/hearsay
 *.test
 *.out
 .DS_Store
