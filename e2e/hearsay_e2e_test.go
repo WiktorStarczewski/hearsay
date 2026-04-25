@@ -404,6 +404,253 @@ func TestE2E_ClaudeMdRoundtrip(t *testing.T) {
 	}
 }
 
+// TestE2E_ReadToolResult_Sizes exercises the read_tool_result content
+// path at four sizes (5K / 50K / 500K / 5M). PR 0 dropped this tool's
+// StructuredContent block in favor of inlining `[source=…, bytes=…,
+// truncated=…]` as the leading line of the body — partly because some
+// MCP consumers were surfacing only the structured channel back to the
+// model, which experienced as "metadata-only" reads.
+//
+// The test confirms the *server-side* delivery: bytes survive the MCP
+// transport at every tier, with sentinel strings present at both ends of
+// the body so we know nothing was silently dropped in the middle.
+//
+// (The display-side hypothesis — Claude Code's MCP client truncating
+// large TextContent blocks before they reach the model — is verified by
+// hand against a real Claude Code loopback; see Phase-2 plan
+// verification step 13.)
+func TestE2E_ReadToolResult_Sizes(t *testing.T) {
+	tiers := []struct {
+		label    string
+		size     int
+		maxBytes int // request override; 0 => use server default (64KB)
+	}{
+		{"5k", 5 * 1024, 16 * 1024},
+		{"50k", 50 * 1024, 100 * 1024},
+		{"500k", 500 * 1024, 1024 * 1024},
+		{"5m", 5 * 1024 * 1024, 10 * 1024 * 1024},
+	}
+
+	// One scratch HOME + data dir for the whole test, with a single
+	// fixture session that references every sidecar via its own
+	// tool_use_id. Each tier still makes its own MCP call.
+	home := t.TempDir()
+	dataDir := t.TempDir()
+
+	sessionID := "size-tier-session"
+	projectDir := filepath.Join(dataDir, "projects", "-tmp-e2e-sizes")
+	if err := os.MkdirAll(filepath.Join(projectDir, sessionID, "tool-results"), 0o755); err != nil {
+		t.Fatalf("mkdir tool-results: %v", err)
+	}
+	sessionPath := filepath.Join(projectDir, sessionID+".jsonl")
+
+	// Build the JSONL: one user prompt, then for each tier an
+	// assistant tool_use + a user tool_result whose content text
+	// embeds the absolute sidecar path so the parser can find it.
+	var lines []string
+	lines = append(lines,
+		`{"type":"user","uuid":"u1","timestamp":"2026-04-24T10:00:00Z","sessionId":"`+sessionID+`","message":{"role":"user","content":"size tier fixture"}}`,
+	)
+	for i, tier := range tiers {
+		toolUseID := "toolu_size_" + tier.label
+		sidecarPath := filepath.Join(projectDir, sessionID, "tool-results", toolUseID+".txt")
+		writeSizedSidecar(t, sidecarPath, tier.size, tier.label)
+
+		uuidA := fmt.Sprintf("a%d", i+1)
+		uuidU := fmt.Sprintf("u%d", i+2)
+		parentA := "u1"
+		if i > 0 {
+			parentA = fmt.Sprintf("u%d", i+1)
+		}
+		// Assistant fires Read tool.
+		lines = append(lines,
+			`{"type":"assistant","uuid":"`+uuidA+`","parentUuid":"`+parentA+
+				`","timestamp":"2026-04-24T10:00:01Z","sessionId":"`+sessionID+
+				`","message":{"role":"assistant","content":[{"type":"tool_use","id":"`+toolUseID+
+				`","name":"Read","input":{"file_path":"/tmp/`+tier.label+`.txt"}}]}}`,
+		)
+		// Tool result text references the sidecar path (matches
+		// `/\S+/tool-results/<id>.txt` regex).
+		lines = append(lines,
+			`{"type":"user","uuid":"`+uuidU+`","parentUuid":"`+uuidA+
+				`","timestamp":"2026-04-24T10:00:02Z","sessionId":"`+sessionID+
+				`","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"`+toolUseID+
+				`","content":"`+sidecarPath+`\n\nPreview (first 2KB):\n…"}]}}`,
+		)
+	}
+	if err := os.WriteFile(sessionPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write session jsonl: %v", err)
+	}
+
+	// Spin up hearsay against this scratch tree and connect.
+	f := startServerAt(t, "size-tier-peer", home, dataDir)
+	cs := f.connectMCP(t)
+	ctx := context.Background()
+
+	for _, tier := range tiers {
+		t.Run(tier.label, func(t *testing.T) {
+			args := map[string]any{
+				"sessionId": sessionID,
+				"toolUseId": "toolu_size_" + tier.label,
+			}
+			if tier.maxBytes > 0 {
+				args["maxBytes"] = tier.maxBytes
+			}
+			res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+				Name:      "read_tool_result",
+				Arguments: args,
+			})
+			if err != nil {
+				t.Fatalf("call read_tool_result: %v", err)
+			}
+			if res.IsError {
+				var msgs []string
+				for _, c := range res.Content {
+					if tc, ok := c.(*mcp.TextContent); ok {
+						msgs = append(msgs, tc.Text)
+					}
+				}
+				t.Fatalf("read_tool_result errored: %s", strings.Join(msgs, " | "))
+			}
+			if len(res.Content) == 0 {
+				t.Fatalf("no content blocks in response")
+			}
+			tc, ok := res.Content[0].(*mcp.TextContent)
+			if !ok {
+				t.Fatalf("first content is %T, want *mcp.TextContent", res.Content[0])
+			}
+			text := tc.Text
+
+			// 1. Metadata header is present and correctly parsed.
+			sep := "\n\n"
+			idx := strings.Index(text, sep)
+			if idx < 0 {
+				t.Fatalf("response missing metadata header: %q", truncate(text, 200))
+			}
+			header := text[:idx]
+			body := text[idx+len(sep):]
+			wantHeaderPrefix := "[source=sidecar, bytes="
+			if !strings.HasPrefix(header, wantHeaderPrefix) {
+				t.Errorf("header = %q, want prefix %q", header, wantHeaderPrefix)
+			}
+			if !strings.Contains(header, "truncated=false") {
+				t.Errorf("expected truncated=false in header (maxBytes=%d, size=%d); got %q",
+					tier.maxBytes, tier.size, header)
+			}
+
+			// 2. Body sentinels survived end-to-end. The fixture
+			// places START-SENTINEL-<label> at byte 0 and
+			// END-SENTINEL-<label> ~32 bytes from the end. If both
+			// reach the consumer the middle is fine.
+			startSentinel := "START-SENTINEL-" + tier.label
+			endSentinel := "END-SENTINEL-" + tier.label
+			if !strings.Contains(body, startSentinel) {
+				t.Errorf("body missing %s (size=%d, body len=%d)",
+					startSentinel, tier.size, len(body))
+			}
+			if !strings.Contains(body, endSentinel) {
+				t.Errorf("body missing %s (size=%d, body len=%d)",
+					endSentinel, tier.size, len(body))
+			}
+
+			// 3. StructuredContent must not carry the old metadata
+			// fields back; PR 0's whole point.
+			if res.StructuredContent != nil {
+				raw, _ := json.Marshal(res.StructuredContent)
+				if s := string(raw); s != "{}" && s != "null" {
+					t.Errorf("read_tool_result must not return populated StructuredContent; got %s", s)
+				}
+			}
+		})
+	}
+}
+
+// writeSizedSidecar generates a deterministic ASCII fixture file at
+// exactly the requested size, with `START-SENTINEL-<label>` at byte 0 and
+// `END-SENTINEL-<label>` near the tail. Mid-file content cycles through
+// the lowercase alphabet so the output compresses well in flight but
+// still has nontrivial content. Sidecars are not committed; each test
+// run generates them fresh in a temp dir.
+func writeSizedSidecar(t *testing.T, path string, size int, label string) {
+	t.Helper()
+	if size < 200 {
+		t.Fatalf("size %d too small for sentinels", size)
+	}
+	startSentinel := []byte("START-SENTINEL-" + label + "\n")
+	endSentinel := []byte("\nEND-SENTINEL-" + label + "\n")
+	buf := make([]byte, size)
+	// Fill with a-z padding first.
+	for i := range buf {
+		buf[i] = byte('a' + (i % 26))
+	}
+	copy(buf[0:], startSentinel)
+	tailOffset := size - len(endSentinel)
+	copy(buf[tailOffset:], endSentinel)
+	if err := os.WriteFile(path, buf, 0o644); err != nil {
+		t.Fatalf("write sidecar %s: %v", path, err)
+	}
+}
+
+// startServerAt is startServer's split-out form: takes pre-built scratch
+// dirs instead of allocating its own. Lets one test share a fixture
+// across multiple subtests without rebuilding the JSONL.
+func startServerAt(t *testing.T, name, home, dataDir string) *fixture {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	stderrBuf := &strings.Builder{}
+	cmd := exec.Command(binaryPath,
+		"--name", name,
+		"--port", fmt.Sprint(port),
+		"--bind", "127.0.0.1",
+		"--data-dir", dataDir,
+	)
+	cmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"XDG_CONFIG_HOME=",
+	)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = &teeWriter{dst: stderrBuf}
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start hearsay: %v", err)
+	}
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	waitForHealth(t, baseURL, 5*time.Second)
+
+	shutdown := func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+		}
+		_ = cmd.Wait()
+	}
+	t.Cleanup(shutdown)
+
+	return &fixture{
+		t:        t,
+		home:     home,
+		dataDir:  dataDir,
+		port:     port,
+		baseURL:  baseURL,
+		token:    readToken(t, home),
+		stderr:   stderrBuf,
+		cmd:      cmd,
+		shutdown: shutdown,
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
 // `hearsay pair` shells out to `claude mcp add`. We stub `claude` with
 // a script that records its argv so we can confirm the invocation was
 // shaped correctly. Sidesteps needing real Claude Code on the CI runner.

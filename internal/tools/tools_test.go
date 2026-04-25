@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -430,16 +431,21 @@ func TestReadToolResult_ReadsSidecar(t *testing.T) {
 		t.Fatalf("tool_result errored: %s", strings.Join(msgs, " | "))
 	}
 	txt := textOf(t, res.Content[0])
-	if !strings.Contains(txt, "SIDECAR-CONTENT") {
-		t.Errorf("sidecar content missing from output: %s", txt)
+	header, body, ok := splitMetadataHeader(txt)
+	if !ok {
+		t.Fatalf("response missing inlined metadata header: %q", txt)
 	}
-	var out ReadToolResultOutput
-	structuredDecode(t, res, &out)
-	if out.Source != "sidecar" {
-		t.Errorf("Source = %q, want sidecar", out.Source)
+	if header.source != "sidecar" {
+		t.Errorf("header.source = %q, want sidecar", header.source)
 	}
-	if out.Truncated {
-		t.Errorf("Truncated = true unexpectedly")
+	if header.truncated {
+		t.Errorf("header.truncated = true unexpectedly")
+	}
+	if header.bytes != len(body) {
+		t.Errorf("header.bytes = %d, body length = %d", header.bytes, len(body))
+	}
+	if !strings.Contains(body, "SIDECAR-CONTENT") {
+		t.Errorf("sidecar body missing expected content: %q", body)
 	}
 }
 
@@ -450,10 +456,42 @@ func TestReadToolResult_TruncatesWhenOverMaxBytes(t *testing.T) {
 		"toolUseId": "toolu_read1",
 		"maxBytes":  5,
 	})
-	var out ReadToolResultOutput
-	structuredDecode(t, res, &out)
-	if !out.Truncated {
+	if res.IsError {
+		t.Fatalf("read_tool_result errored: content=%+v", res.Content)
+	}
+	txt := textOf(t, res.Content[0])
+	header, body, ok := splitMetadataHeader(txt)
+	if !ok {
+		t.Fatalf("response missing inlined metadata header: %q", txt)
+	}
+	if !header.truncated {
 		t.Errorf("expected truncated=true with maxBytes=5")
+	}
+	if !strings.Contains(body, "[truncated at 5 bytes]") {
+		t.Errorf("body missing truncation marker: %q", body)
+	}
+}
+
+func TestReadToolResult_NoStructuredContent(t *testing.T) {
+	cs := connectPair(t)
+	res := callTool(t, cs, "read_tool_result", map[string]any{
+		"sessionId": "11111111-2222-3333-4444-555555555555",
+		"toolUseId": "toolu_read1",
+	})
+	// PR 0 deliberately drops the populated StructuredContent block from
+	// this tool — metadata is inlined into the body header instead. The
+	// SDK may still emit `{}` for an empty struct, but it must not carry
+	// the old {source, truncated, bytes} fields back to the caller.
+	if res.StructuredContent != nil {
+		raw, err := json.Marshal(res.StructuredContent)
+		if err != nil {
+			t.Fatalf("marshal structured: %v", err)
+		}
+		// Empty struct serializes to "{}". Anything richer means the
+		// PR-0 inlining regressed.
+		if s := string(raw); s != "{}" && s != "null" {
+			t.Errorf("read_tool_result must not return populated StructuredContent; got %s", s)
+		}
 	}
 }
 
@@ -532,4 +570,58 @@ func textOf(t *testing.T, c mcp.Content) string {
 		t.Fatalf("expected TextContent, got %T", c)
 	}
 	return tc.Text
+}
+
+// readToolResultHeader captures the parsed leading line that PR 0 inlines
+// into read_tool_result responses: `[source=<sidecar|inline>, bytes=N, truncated=<bool>]`.
+type readToolResultHeader struct {
+	source    string
+	bytes     int
+	truncated bool
+}
+
+// splitMetadataHeader parses the inlined metadata header that PR 0
+// prepends to every read_tool_result body, separated from the body by a
+// blank line. Returns ok=false if the input does not match the expected
+// shape — caller decides whether that's a fatal test failure.
+func splitMetadataHeader(s string) (readToolResultHeader, string, bool) {
+	const sep = "\n\n"
+	idx := strings.Index(s, sep)
+	if idx < 0 {
+		return readToolResultHeader{}, "", false
+	}
+	line := s[:idx]
+	body := s[idx+len(sep):]
+	if !strings.HasPrefix(line, "[") || !strings.HasSuffix(line, "]") {
+		return readToolResultHeader{}, "", false
+	}
+	inner := line[1 : len(line)-1] // strip [ ]
+	var h readToolResultHeader
+	for _, kv := range strings.Split(inner, ", ") {
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			return readToolResultHeader{}, "", false
+		}
+		k, v := kv[:eq], kv[eq+1:]
+		switch k {
+		case "source":
+			h.source = v
+		case "bytes":
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return readToolResultHeader{}, "", false
+			}
+			h.bytes = n
+		case "truncated":
+			switch v {
+			case "true":
+				h.truncated = true
+			case "false":
+				h.truncated = false
+			default:
+				return readToolResultHeader{}, "", false
+			}
+		}
+	}
+	return h, body, true
 }
