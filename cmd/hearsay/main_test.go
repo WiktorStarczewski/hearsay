@@ -423,6 +423,28 @@ func captureStdout(t *testing.T, fn func()) string {
 	return string(<-done)
 }
 
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+
+	done := make(chan []byte)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(r)
+		done <- buf.Bytes()
+	}()
+
+	fn()
+	w.Close()
+	return string(<-done)
+}
+
 // seedConfig drops a fake config.json at whatever location
 // internal/config.Dir() resolves to for the current platform, so the
 // tests work on both macOS (Library/Application Support) and Linux
@@ -709,6 +731,83 @@ func TestRunServer_RegenerateTokenBranch(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	sigCh <- syscall.SIGTERM
 	<-done
+}
+
+// TestRunServer_EnableAgentRefusesWithoutAPIKey is the load-bearing
+// guard from the plan's error contract: hearsay must refuse to start
+// (no half-configured state) when --enable-agent is set but the API
+// key env is empty.
+func TestRunServer_EnableAgentRefusesWithoutAPIKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+
+	stderrCapture := captureStderr(t, func() {
+		// runServerWithSignals exits before binding when init fails;
+		// pre-fill sigCh so the (unused) shutdown branch can't deadlock.
+		sigCh := make(chan os.Signal, 1)
+		sigCh <- syscall.SIGTERM
+		code := runServerWithSignals([]string{
+			"--name", "ivan",
+			"--bind", "127.0.0.1",
+			"--port", "0",
+			"--quiet",
+			"--enable-agent",
+		}, sigCh)
+		if code == 0 {
+			t.Errorf("expected non-zero exit when --enable-agent and key is empty")
+		}
+	})
+	if !strings.Contains(stderrCapture, "ANTHROPIC_API_KEY") {
+		t.Errorf("expected error mentioning ANTHROPIC_API_KEY; got: %s", stderrCapture)
+	}
+}
+
+// TestRunServer_EnableAgentCustomKeyEnv exercises the --agent-api-key-env
+// override branch.  We point the flag at a non-default env var name and
+// confirm the *missing* var causes the same refusal.
+func TestRunServer_EnableAgentCustomKeyEnv(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HEARSAY_TEST_KEY_DOES_NOT_EXIST", "")
+
+	stderrCapture := captureStderr(t, func() {
+		sigCh := make(chan os.Signal, 1)
+		sigCh <- syscall.SIGTERM
+		code := runServerWithSignals([]string{
+			"--name", "ivan",
+			"--bind", "127.0.0.1",
+			"--port", "0",
+			"--quiet",
+			"--enable-agent",
+			"--agent-api-key-env", "HEARSAY_TEST_KEY_DOES_NOT_EXIST",
+		}, sigCh)
+		if code == 0 {
+			t.Errorf("expected non-zero exit")
+		}
+	})
+	if !strings.Contains(stderrCapture, "HEARSAY_TEST_KEY_DOES_NOT_EXIST") {
+		t.Errorf("expected error mentioning the override env var; got: %s", stderrCapture)
+	}
+}
+
+// TestMaskKey covers the rendering used in startup-log key masking.
+func TestMaskKey(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", "***"},
+		{"sk-ant", "***"},
+		{"sk-ant-x12345abcd", "sk-ant-....abcd"},
+	}
+	for _, c := range cases {
+		if got := maskKey(c.in); got != c.want {
+			t.Errorf("maskKey(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
 }
 
 // runInvite with a fake tailscale on PATH exercises the tailscale DNS

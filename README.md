@@ -173,6 +173,63 @@ If you'd rather edit the config yourself, add this under `mcpServers` in `~/.cla
 | `read_tool_result` | Fetch the full content of a tool result (Read outputs, long stdouts). Handles inline + sidecar storage. |
 | `get_session_summary` | Compact digest: first user ask, tool-call counts, subagent list, last assistant text. |
 | `get_peer_info` | `{name, version, sessionCount, activeSessionCount}` — sanity-check which peer you're talking to. |
+| `ask_peer_claude` | **Phase-2, requires `--enable-agent`.** Spawns a parallel Claude session on the peer's box with read-only filesystem tools. Returns a markdown transcript + `{turnCount, toolCallCount, stopReason, elapsedMs}`. |
+
+## Interactive mode (Phase 2)
+
+Phase-1 lets your Claude *read* your teammate's past Claude Code sessions. Phase 2 lets it *drive a fresh agent* on their machine that can read / glob / grep the live filesystem — without the teammate touching anything. Useful when you need primary data, not Ivan's after-the-fact diagnosis.
+
+**Off by default.** A v0.2 binary without `--enable-agent` behaves bit-for-bit like v0.1.
+
+### Enable on the peer side
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...           # Ivan's key — pays the bill
+hearsay --name ivan --enable-agent
+```
+
+The peer must opt in; the API key is read once at startup and never logged or persisted. The cost of every call is bounded by per-turn budgets (default: 32k tokens, 20 tool calls, 120s wall-clock per call).
+
+If `--enable-agent` is set but the env var is empty, hearsay refuses to start — no half-configured state.
+
+### Use it from the consumer side
+
+After `hearsay pair <invite>` and a Claude Code restart, your Claude has one new tool per peer:
+
+- `mcp__ivan__ask_peer_claude({prompt, project?, max_tokens?, max_tool_calls?, timeout_seconds?})` — spawns a parallel Claude session on Ivan's box with read-only tools (`read` / `glob` / `grep`). Returns a markdown transcript plus `{turnCount, toolCallCount, stopReason, elapsedMs}`. Short-lived; no state kept after the call. (PR-B will add stateful conversations.)
+
+Example natural-language prompt to your Claude:
+
+> "ask Ivan's box to grep for `lock starvation` in his stress-test logs"
+
+Routes to `ask_peer_claude` automatically. To replay what Ivan already did (read past transcripts), Claude reaches for `list_sessions` / `read_session` instead.
+
+### What the peer's agent CAN'T do
+
+- Run shell commands (`bash` is **not** in the read-only allowlist).
+- Edit / write / delete files.
+- Read files outside the project root the agent was started in.
+- Cost more than the per-call budget; runaway sessions are bounded.
+- Send messages back into Ivan's interactive Claude Code session — it's a separate parallel session, not a hijack.
+
+A second-leg defense rejects any `tool_use` for a name not in `{read, glob, grep}` even if the upstream emits one anyway (compromised SDK / future-version drift).
+
+### Audit log
+
+Every agent call appends one JSON line to `~/Library/Logs/hearsay/agent.log` (macOS) or `$XDG_STATE_HOME/hearsay/agent.log` (Linux): `{timestamp, peer, convId, turnIndex, promptBytes, toolCalls: [{name, argBytes}], responseBytes, elapsedMs, stopReason, errorSummary?}`. **Sizes only — no prompt / response / tool-arg content, no hashes.** Override with `--agent-log-path <file>`.
+
+### Agent flags
+
+```
+--enable-agent                          register the agent tools (off by default)
+--agent-api-key-env <NAME>              env var the API key is read from (default ANTHROPIC_API_KEY)
+--agent-base-url <url>                  override Anthropic API base URL (test stubs / regional endpoints)
+--agent-model <id>                      override model id (default claude-opus-4-7)
+--agent-default-max-tokens <n>          per-turn token budget (default 32768)
+--agent-default-max-tool-calls <n>      per-turn tool-call budget (default 20)
+--agent-default-timeout-seconds <n>     per-call wall-clock budget (default 120)
+--agent-log-path <path>                 audit log path (default platform-specific)
+```
 
 ## Optional: CLAUDE.md discoverability block
 
@@ -202,6 +259,16 @@ Server flags:
   --live-window-seconds <n>  isLive threshold (default 300)
   --regenerate-token         rotate the stored bearer token
   --quiet                    suppress tool-call logs
+
+Phase-2 agent flags (off by default):
+  --enable-agent
+  --agent-api-key-env <NAME>             (default ANTHROPIC_API_KEY)
+  --agent-base-url <url>                 (test stubs / regional endpoints)
+  --agent-model <id>                     (default claude-opus-4-7)
+  --agent-default-max-tokens <n>         (default 32768)
+  --agent-default-max-tool-calls <n>     (default 20)
+  --agent-default-timeout-seconds <n>    (default 120)
+  --agent-log-path <path>
 ```
 
 ## Design notes

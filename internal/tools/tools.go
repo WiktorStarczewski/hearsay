@@ -18,20 +18,27 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/WiktorStarczewski/hearsay/internal/agent"
 	"github.com/WiktorStarczewski/hearsay/internal/transcript"
 )
 
 // Context bundles the settings every tool handler needs. It's built once
 // in main.go and passed into Register.
 type Context struct {
-	PeerName         string
-	PeerVersion      string
-	DataDir          string
-	LiveWindow       time.Duration
-	Log              func(tool, status string, dur time.Duration)
+	PeerName    string
+	PeerVersion string
+	DataDir     string
+	LiveWindow  time.Duration
+	Log         func(tool, status string, dur time.Duration)
+
+	// Agent is non-nil only when --enable-agent was passed; nil
+	// keeps Phase-1 behavior (the 8 read-only tools, no ask_peer_claude).
+	Agent agent.Agent
 }
 
-// Register wires all eight tools onto an already-constructed mcp.Server.
+// Register wires the always-on Phase-1 tools onto an already-
+// constructed mcp.Server, plus any Phase-2 tools whose dependencies
+// are present in ctx.
 func Register(s *mcp.Server, ctx Context) {
 	addListSessions(s, ctx)
 	addGetCurrentSession(s, ctx)
@@ -41,6 +48,10 @@ func Register(s *mcp.Server, ctx Context) {
 	addReadToolResult(s, ctx)
 	addGetSessionSummary(s, ctx)
 	addGetPeerInfo(s, ctx)
+
+	if ctx.Agent != nil {
+		addAskPeerClaude(s, ctx)
+	}
 }
 
 // capName converts "wiktor" → "Wiktor" for display in tool descriptions.
