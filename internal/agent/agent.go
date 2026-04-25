@@ -99,12 +99,73 @@ type Transcript struct {
 	ErrorSummary  ErrorSummary // populated iff StopReason == "error"
 }
 
-// Agent is the interface ask_peer_claude (and PR-B's conversation
-// tools) call into.  PR A only implements OneShot; PR B will extend
-// the same package with the conversation-lifecycle methods.
+// ConvID is an opaque handle to a hearsay-managed conversation.  We
+// use the SDK's session ID directly so there's no map-lookup
+// indirection inside the agent layer.
+type ConvID string
+
+// StartReq is the input to Agent.StartConversation.
+type StartReq struct {
+	SystemPrompt string
+	Project      string
+	Budget       Budget // becomes the conversation's per-turn default
+}
+
+// ConvMeta mirrors list_peer_conversations' output one-for-one.
+type ConvMeta struct {
+	ConvID         ConvID
+	StartedAt      time.Time
+	LastActivityAt time.Time
+	TurnCount      int
+	// Preview is the first ~140 *runes* (not bytes) of the first user
+	// message — rune-based truncation so a multi-byte codepoint at the
+	// boundary doesn't yield invalid UTF-8.  When the conversation has
+	// been started but no send_peer_message has happened yet, falls
+	// back to the first ~140 runes of the system_prompt (or empty if
+	// no system_prompt was set).
+	Preview string
+}
+
+// EndReason discriminates how a conversation ended; carried into the
+// audit log + the end_peer_conversation tool's output.
+type EndReason string
+
+const (
+	EndedByCaller   EndReason = "caller"
+	EndedByIdleReap EndReason = "idle_timeout"
+	EndedByShutdown EndReason = "shutdown"
+)
+
+// EndSummary mirrors end_peer_conversation's tool output.
+type EndSummary struct {
+	Ended        bool
+	AlreadyEnded bool      // true if the conv was already ended (idempotent re-end)
+	TotalTurns   int
+	EndedReason  EndReason
+}
+
+// Agent is the interface every Phase-2 tool calls into.  PR A landed
+// OneShot; PR B added the conversation-lifecycle methods.
 type Agent interface {
 	OneShot(ctx context.Context, req OneShotRequest) (Transcript, error)
+	StartConversation(ctx context.Context, req StartReq) (ConvID, time.Time /*startedAt*/, Budget /*effective*/, error)
+	SendMessage(ctx context.Context, convID ConvID, prompt string, budget Budget) (Transcript, error)
+	ListConversations() []ConvMeta
+	EndConversation(ctx context.Context, convID ConvID, reason EndReason) (EndSummary, error)
 }
+
+// ErrUnknownConv is returned by SendMessage / EndConversation when
+// the convID has no matching live conversation (typo, idle-reaped,
+// or already ended).
+var ErrUnknownConv = errors.New("agent: unknown conversation id")
+
+// ErrConvCap is returned by StartConversation when --max-conversations
+// is full.  The tool layer translates this into errorSummary=max_conversations.
+var ErrConvCap = errors.New("agent: max conversations reached")
+
+// ErrConvReaped is returned by SendMessage when the named conversation
+// existed but was reaped after the idle timeout.
+var ErrConvReaped = errors.New("agent: conversation reaped after idle timeout")
 
 // ErrAgentDisabled is returned when callers try to use an Agent
 // instance that wasn't constructed (--enable-agent off).  The tools

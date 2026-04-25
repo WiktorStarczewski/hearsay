@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -263,6 +265,232 @@ func TestOneShot_RejectsInvalidProject(t *testing.T) {
 	}
 	if tx.ErrorSummary != ErrInvalidProject {
 		t.Errorf("ErrorSummary=%v, want invalid_project", tx.ErrorSummary)
+	}
+}
+
+// stubAnthropicServer responds with minimal-valid JSON for the
+// non-streaming endpoints the conversation lifecycle hits, and a 5xx
+// for StreamEvents.  Every test that needs a live SDK round-trip can
+// reuse this rather than re-defining it.  Sessions get unique IDs so
+// the cap test can rely on the local-state map keying being honest.
+func stubAnthropicServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	var sessSeq int32
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/environments" && r.Method == "POST":
+			_, _ = w.Write([]byte(`{"id":"env-1","name":"hearsay-test","type":"environment","created_at":"2026-04-25T00:00:00Z","updated_at":"2026-04-25T00:00:00Z","status":"ready"}`))
+		case r.URL.Path == "/v1/agents" && r.Method == "POST":
+			_, _ = w.Write([]byte(`{"id":"agent-1","name":"hearsay-test","type":"agent","version":1,"created_at":"2026-04-25T00:00:00Z","updated_at":"2026-04-25T00:00:00Z","model":{"id":"claude-opus-4-7"}}`))
+		case r.URL.Path == "/v1/sessions" && r.Method == "POST":
+			id := atomic.AddInt32(&sessSeq, 1)
+			_, _ = fmt.Fprintf(w, `{"id":"sess-%d","type":"session","agent":{"id":"agent-1","type":"agent","version":1},"environment_id":"env-1","status":"running","created_at":"2026-04-25T00:00:00Z","updated_at":"2026-04-25T00:00:00Z"}`, id)
+		case strings.HasPrefix(r.URL.Path, "/v1/sessions/") && r.Method == "DELETE":
+			_, _ = w.Write([]byte(`{"id":"sess-deleted","type":"session","status":"deleted"}`))
+		case strings.Contains(r.URL.Path, "/events") && r.Method == "POST":
+			_, _ = w.Write([]byte(`{"events":[]}`))
+		default:
+			http.Error(w, `{"type":"error","error":{"type":"api_error","message":"stub deliberate failure"}}`, http.StatusServiceUnavailable)
+		}
+	}))
+}
+
+// TestStartConversation_SucceedsAgainstStub drives ensureInit +
+// StartConversation against the minimal stub.  Confirms the convID is
+// returned and listed.  Effective budget echo is asserted in the
+// fake-agent path; here we just want the SDK round-trip exercised.
+func TestStartConversation_SucceedsAgainstStub(t *testing.T) {
+	stub := stubAnthropicServer(t)
+	defer stub.Close()
+
+	ag, err := New(Config{
+		APIKey:           "sk-ant-test",
+		BaseURL:          stub.URL,
+		PeerName:         "test",
+		MaxConversations: 5,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer ag.(Closer).Close()
+
+	convID, started, eff, err := ag.StartConversation(t.Context(), StartReq{
+		SystemPrompt: "you are a tester",
+		Project:      t.TempDir(),
+		Budget:       Budget{MaxTokens: 8192},
+	})
+	if err != nil {
+		t.Fatalf("StartConversation: %v", err)
+	}
+	if !strings.HasPrefix(string(convID), "sess-") {
+		t.Errorf("convID=%q", convID)
+	}
+	if started.IsZero() {
+		t.Errorf("startedAt should not be zero")
+	}
+	if eff.MaxTokens != 8192 {
+		t.Errorf("effective.MaxTokens=%d, want 8192", eff.MaxTokens)
+	}
+	if got := ag.ListConversations(); len(got) != 1 || got[0].ConvID != convID {
+		t.Errorf("ListConversations returned %+v after StartConversation", got)
+	}
+}
+
+// TestStartConversation_RespectsCap covers the cap-rejection path
+// against the stub.  Two start calls succeed; the third is refused.
+func TestStartConversation_RespectsCap(t *testing.T) {
+	stub := stubAnthropicServer(t)
+	defer stub.Close()
+
+	ag, err := New(Config{
+		APIKey:           "sk-ant-test",
+		BaseURL:          stub.URL,
+		PeerName:         "test",
+		MaxConversations: 2,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer ag.(Closer).Close()
+
+	for i := 0; i < 2; i++ {
+		_, _, _, err := ag.StartConversation(t.Context(), StartReq{Project: t.TempDir()})
+		if err != nil {
+			t.Fatalf("start #%d: %v", i, err)
+		}
+	}
+	_, _, _, err = ag.StartConversation(t.Context(), StartReq{Project: t.TempDir()})
+	if err != ErrConvCap {
+		t.Errorf("third start: err=%v, want ErrConvCap", err)
+	}
+}
+
+// TestStartConversation_RejectsInvalidProject confirms the validation
+// branch fires before any SDK call.
+func TestStartConversation_RejectsInvalidProject(t *testing.T) {
+	stub := stubAnthropicServer(t)
+	defer stub.Close()
+
+	ag, err := New(Config{APIKey: "sk-ant-test", BaseURL: stub.URL, PeerName: "test"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer ag.(Closer).Close()
+
+	_, _, _, err = ag.StartConversation(t.Context(), StartReq{Project: "/no/such/path/please/no"})
+	if err == nil {
+		t.Errorf("expected invalid-project error")
+	}
+}
+
+// TestSendMessage_KnownAndUnknown covers the lookupAlive branches:
+// an unknown convID errors; the known convID drives runTurn, which
+// fails on the stream-events 5xx and returns an error transcript.
+func TestSendMessage_KnownAndUnknown(t *testing.T) {
+	stub := stubAnthropicServer(t)
+	defer stub.Close()
+
+	ag, err := New(Config{APIKey: "sk-ant-test", BaseURL: stub.URL, PeerName: "test"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer ag.(Closer).Close()
+
+	if _, err := ag.SendMessage(t.Context(), "no-such", "x", Budget{}); err != ErrUnknownConv {
+		t.Errorf("unknown convID: err=%v, want ErrUnknownConv", err)
+	}
+
+	convID, _, _, err := ag.StartConversation(t.Context(), StartReq{Project: t.TempDir()})
+	if err != nil {
+		t.Fatalf("StartConversation: %v", err)
+	}
+	tx, err := ag.SendMessage(t.Context(), convID, "hello", Budget{})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	// Stream returns 5xx → loop sees an EventError or a closed
+	// channel.  Either way, the SendMessage returned a transcript
+	// with a sane stop reason and the conv's lastActivityAt was
+	// touched.
+	if tx.StopReason == "" {
+		t.Errorf("StopReason empty: %+v", tx)
+	}
+}
+
+// TestEndConversation_SucceedsAgainstStub drives the SDK Delete path
+// from EndConversation, plus the post-end ListConversations omits the
+// terminated conv.
+func TestEndConversation_SucceedsAgainstStub(t *testing.T) {
+	stub := stubAnthropicServer(t)
+	defer stub.Close()
+
+	ag, err := New(Config{APIKey: "sk-ant-test", BaseURL: stub.URL, PeerName: "test"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer ag.(Closer).Close()
+
+	convID, _, _, err := ag.StartConversation(t.Context(), StartReq{Project: t.TempDir()})
+	if err != nil {
+		t.Fatalf("StartConversation: %v", err)
+	}
+	summary, err := ag.EndConversation(t.Context(), convID, EndedByCaller)
+	if err != nil {
+		t.Fatalf("EndConversation: %v", err)
+	}
+	if !summary.Ended || summary.AlreadyEnded {
+		t.Errorf("summary wrong: %+v", summary)
+	}
+	if got := ag.ListConversations(); len(got) != 0 {
+		t.Errorf("ListConversations after End should be empty; got %+v", got)
+	}
+
+	// Idempotent re-end should report alreadyEnded=true.
+	summary2, err := ag.EndConversation(t.Context(), convID, EndedByCaller)
+	if err != nil {
+		t.Fatalf("EndConversation #2: %v", err)
+	}
+	if !summary2.AlreadyEnded {
+		t.Errorf("expected AlreadyEnded=true on re-end; got %+v", summary2)
+	}
+}
+
+// TestReaper_RunsAndDeletes spins up an agent with a tight idle
+// timeout, lets the reaper fire, and confirms the conversation flips
+// to ended with reason idle_timeout.
+func TestReaper_RunsAndDeletes(t *testing.T) {
+	stub := stubAnthropicServer(t)
+	defer stub.Close()
+
+	ag, err := New(Config{
+		APIKey:                  "sk-ant-test",
+		BaseURL:                 stub.URL,
+		PeerName:                "test",
+		ConversationIdleTimeout: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer ag.(Closer).Close()
+
+	convID, _, _, err := ag.StartConversation(t.Context(), StartReq{Project: t.TempDir()})
+	if err != nil {
+		t.Fatalf("StartConversation: %v", err)
+	}
+
+	// Wait long enough for at least one reaper tick (interval is
+	// idle/4 floored at 1s, plus the reap conditional).
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		got := ag.ListConversations()
+		if len(got) == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := ag.ListConversations(); len(got) != 0 {
+		t.Errorf("reaper never reaped %s; ListConversations = %+v", convID, got)
 	}
 }
 

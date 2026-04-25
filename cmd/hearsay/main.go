@@ -112,6 +112,8 @@ PHASE-2 AGENT FLAGS (off by default)
   --agent-default-timeout-seconds <n>   per-call wall-clock budget in seconds (default 120)
   --agent-log-path <path>   audit log (default: ~/Library/Logs/hearsay/agent.log on macOS,
                             $XDG_STATE_HOME/hearsay/agent.log elsewhere)
+  --max-conversations <n>   concurrent-conversations cap (default 10)
+  --conversation-idle-timeout <dur>     reap conversations idle past this (default 15m)
 
 ADD-PEER FLAGS
   --url <url>               peer's hearsay MCP URL (e.g. http://ivan-mac.tailXXXX.ts.net:3456/mcp)
@@ -160,6 +162,8 @@ func runServerWithSignals(args []string, sigCh <-chan os.Signal) int {
 		agentMaxTools   = fs.Int("agent-default-max-tool-calls", 20, "default per-turn max_tool_calls budget")
 		agentTimeoutSec = fs.Int("agent-default-timeout-seconds", 120, "default per-call wall-clock budget in seconds")
 		agentLogPath    = fs.String("agent-log-path", "", "audit-log path (default: platform-specific — see DefaultAuditPath)")
+		maxConvs        = fs.Int("max-conversations", 10, "concurrent-conversations cap")
+		convIdle        = fs.Duration("conversation-idle-timeout", 15*time.Minute, "reap conversations idle past this duration")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -207,7 +211,9 @@ func runServerWithSignals(args []string, sigCh <-chan os.Signal) int {
 				MaxToolCalls: *agentMaxTools,
 				Timeout:      time.Duration(*agentTimeoutSec) * time.Second,
 			},
-			Auditor: auditor,
+			Auditor:                 auditor,
+			MaxConversations:        *maxConvs,
+			ConversationIdleTimeout: *convIdle,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "hearsay: agent init: %v\n", err)
@@ -262,6 +268,9 @@ func runServerWithSignals(args []string, sigCh <-chan os.Signal) int {
 	fmt.Fprintln(os.Stderr, "hearsay: shutting down…")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if closer, ok := ag.(agent.Closer); ok && closer != nil {
+		closer.Close()
+	}
 	if err := srv.Shutdown(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "hearsay: shutdown error: %v\n", err)
 		return 1

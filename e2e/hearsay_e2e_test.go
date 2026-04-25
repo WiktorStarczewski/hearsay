@@ -751,6 +751,68 @@ func TestE2E_AgentToolPresentWhenEnabled(t *testing.T) {
 	}
 }
 
+// TestE2E_ConversationToolsPresent confirms all four PR-B
+// conversation tools are in the catalog when --enable-agent is set.
+func TestE2E_ConversationToolsPresent(t *testing.T) {
+	f := startServerWithEnv(t, "conv-tools",
+		[]string{"--enable-agent", "--quiet"},
+		[]string{"ANTHROPIC_API_KEY=sk-ant-fake-test-key-12345"},
+	)
+	cs := f.connectMCP(t)
+	want := map[string]bool{
+		"start_peer_conversation": false,
+		"send_peer_message":       false,
+		"list_peer_conversations": false,
+		"end_peer_conversation":   false,
+	}
+	for tool := range cs.Tools(context.Background(), nil) {
+		if _, expected := want[tool.Name]; expected {
+			want[tool.Name] = true
+		}
+	}
+	for name, present := range want {
+		if !present {
+			t.Errorf("tool %q missing from catalog", name)
+		}
+	}
+}
+
+// TestE2E_ConversationCapFlagWiredThrough confirms the
+// --max-conversations flag reaches the agent layer.  We can't actually
+// fill the cap without standing up a full Anthropic stub, but we CAN
+// confirm `list_peer_conversations` returns an empty list (proving the
+// agent state map is wired) and that the binary accepts the flag.
+func TestE2E_ConversationCapFlagWiredThrough(t *testing.T) {
+	f := startServerWithEnv(t, "conv-cap",
+		[]string{
+			"--enable-agent",
+			"--quiet",
+			"--max-conversations", "2",
+			"--conversation-idle-timeout", "5s",
+		},
+		[]string{"ANTHROPIC_API_KEY=sk-ant-fake-test-key-12345"},
+	)
+	cs := f.connectMCP(t)
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "list_peer_conversations",
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("list_peer_conversations: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("list_peer_conversations errored: %+v", res.Content)
+	}
+	out := structured(t, res)
+	convs, ok := out["conversations"].([]any)
+	if !ok {
+		t.Fatalf("conversations field missing or wrong type: %+v", out)
+	}
+	if len(convs) != 0 {
+		t.Errorf("freshly-started server should have 0 conversations, got %d", len(convs))
+	}
+}
+
 // TestE2E_AgentRefusesStartWithoutKey confirms the error-contract row:
 // `--enable-agent` set but ANTHROPIC_API_KEY empty ⇒ refuse to start.
 // We can't use startServerWithEnv (it waits for /health) — the binary

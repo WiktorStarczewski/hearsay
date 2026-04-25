@@ -51,6 +51,10 @@ func Register(s *mcp.Server, ctx Context) {
 
 	if ctx.Agent != nil {
 		addAskPeerClaude(s, ctx)
+		addStartPeerConversation(s, ctx)
+		addSendPeerMessage(s, ctx)
+		addListPeerConversations(s, ctx)
+		addEndPeerConversation(s, ctx)
 	}
 }
 
