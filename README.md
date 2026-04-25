@@ -178,7 +178,7 @@ If you'd rather edit the config yourself, add this under `mcpServers` in `~/.cla
 | `read_tool_result` | Fetch the full content of a tool result (Read outputs, long stdouts). Handles inline + sidecar storage. |
 | `get_session_summary` | Compact digest: first user ask, tool-call counts, subagent list, last assistant text. |
 | `get_peer_info` | `{name, version, sessionCount, activeSessionCount}` — sanity-check which peer you're talking to. |
-| `ask_peer_claude` | **Phase-2, requires `--enable-agent`.** Spawns a parallel Claude session on the peer's box with read-only filesystem tools. Returns a markdown transcript + `{turnCount, toolCallCount, stopReason, elapsedMs}`. |
+| `ask_peer_claude` | **Phase-2, requires `--enable-agent`.** Spawns a parallel Claude Code subprocess on the peer's box with read-only filesystem tools (`Read` / `Glob` / `Grep`). Returns a markdown transcript + `{turnCount, toolCallCount, stopReason, elapsedMs}`. |
 | `start_peer_conversation` | **Phase-2.** Open a stateful read-only conversation. Returns `{convId, startedAt, effectiveBudget}`. |
 | `send_peer_message` | **Phase-2.** One more turn against an existing convId. |
 | `list_peer_conversations` | **Phase-2.** Active conversations sorted by `lastActivityAt` desc. |
@@ -186,7 +186,7 @@ If you'd rather edit the config yourself, add this under `mcpServers` in `~/.cla
 
 ## Interactive mode (Phase 2)
 
-Phase-1 lets your Claude *read* your teammate's past Claude Code sessions. Phase 2 lets it *drive a fresh Claude Code session* on their machine that can read / glob / grep the live filesystem — without the teammate touching anything. Useful when you need primary data, not Ivan's after-the-fact diagnosis.
+Phase-1 lets your Claude *read* your teammate's past Claude Code sessions. Phase 2 lets it *drive a fresh Claude Code session* on their machine that can `Read` / `Glob` / `Grep` the live filesystem — without the teammate touching anything. Useful when you need primary data, not Ivan's after-the-fact diagnosis.
 
 **Off by default.** A binary without `--enable-agent` behaves identically to Phase 1.
 
