@@ -30,7 +30,19 @@ jobs:
           # toolchain the repo declares rather than hard-coding a
           # version here.
           go-version-file: 'go.mod'
-          cache: true
+          # setup-go's default cache key hashes only go.sum. When two
+          # PRs in a row share a go.sum but touch local source (PR B
+          # didn't bump go.sum after PR A), the second PR's build can
+          # restore stale instrumented test binaries from the first
+          # PR's cache. The resulting -coverpkg=./... profile ends up
+          # with mixed-version cover blocks for the same source file
+          # (e.g. printHelp ending at line 125 in three packages and
+          # line 127 in six), which `go tool cover -func` treats as
+          # two distinct blocks and drops the function's coverage to
+          # ~33%. This bit us in #8: 90.7% locally vs 65% on CI on
+          # the same commit. Keeping cache off until we have a key
+          # that hashes source files too.
+          cache: false
 
       - name: Download modules
         run: go mod download
