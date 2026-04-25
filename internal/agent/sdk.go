@@ -18,16 +18,24 @@ import (
 // Config bundles everything sdkAgent needs.  Built once in main.go and
 // reused for every call.
 type Config struct {
-	APIKey       string
-	BaseURL      string // empty => default api.anthropic.com; tests set ANTHROPIC_BASE_URL
-	Model        string // default "claude-opus-4-7"
-	PeerName     string
+	APIKey        string
+	BaseURL       string // empty => default api.anthropic.com; tests set ANTHROPIC_BASE_URL
+	Model         string // default "claude-opus-4-7"
+	PeerName      string
 	DefaultBudget Budget
-	Auditor      *Auditor
+	Auditor       *Auditor
 	// FallbackProject is the cwd handlers see when OneShotRequest.Project is empty
 	// AND no most-recent-session-cwd is available.  Defaults to os.Getwd() at
 	// construction time.
 	FallbackProject string
+	// MaxConversations caps the number of concurrent conversations
+	// (PR B).  0 disables the cap.  StartConversation rejects with
+	// ErrConvCap when the cap is full.
+	MaxConversations int
+	// ConversationIdleTimeout marks conversations whose lastActivityAt
+	// is older than the threshold as ended (reason "idle_timeout") via
+	// a background goroutine.  0 disables the reaper.
+	ConversationIdleTimeout time.Duration
 }
 
 // New constructs a production sdkAgent backed by anthropic-sdk-go.
@@ -50,7 +58,21 @@ func New(cfg Config) (Agent, error) {
 		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
 	}
 	client := anthropic.NewClient(opts...)
-	return &sdkAgent{cfg: cfg, client: &client}, nil
+	a := &sdkAgent{cfg: cfg, client: &client}
+	a.startReaper()
+	return a, nil
+}
+
+// Closer is implemented by sdkAgent so the binary can shut the
+// background reaper down on SIGTERM.
+type Closer interface {
+	Close()
+}
+
+// Close stops the background idle reaper and waits for it to exit.
+// Calling this on a non-reaping agent is a no-op.
+func (a *sdkAgent) Close() {
+	a.stopReaper()
 }
 
 // sdkAgent is the production Agent implementation.  Wraps the SDK and
@@ -67,6 +89,18 @@ type sdkAgent struct {
 	initErr  error
 	envID    string
 	agentID  string
+
+	// PR-B conversation state.  convsMu guards convs; each conv
+	// also has its own mutex (in conversation.mu) used to serialize
+	// turns.  Holding a.convsMu while taking conv.mu is fine; the
+	// reverse direction is forbidden.
+	convsMu sync.Mutex
+	convs   map[ConvID]*conversation
+
+	// reaperStop / reaperDone wire the background idle reaper.
+	// reaperStop nil ⇒ reaper not running.
+	reaperStop chan struct{}
+	reaperDone chan struct{}
 }
 
 // OneShot implements Agent.OneShot.  Creates a fresh agent + session
@@ -149,8 +183,10 @@ func (a *sdkAgent) ensureInit(ctx context.Context) error {
 	return a.initErr
 }
 
-// runOnce: open a session, send the prompt, drain events through
-// runEventLoop, return the assembled transcript.
+// runOnce: open a session, hand it to runTurn, return the transcript.
+// Session is short-lived — discarded after the call.  Most of the
+// per-turn work lives in conversations.go's runTurn so the OneShot
+// and SendMessage paths stay in lockstep.
 func (a *sdkAgent) runOnce(
 	ctx context.Context,
 	prompt, project string,
@@ -164,7 +200,7 @@ func (a *sdkAgent) runOnce(
 		}, nil, nil
 	}
 
-	// Open a session against the cached agent + environment.
+	// Open a fresh session against the cached agent + environment.
 	sess, err := a.client.Beta.Sessions.New(ctx, anthropic.BetaSessionNewParams{
 		Agent:         anthropic.BetaSessionNewParamsAgentUnion{OfString: param.NewOpt(a.agentID)},
 		EnvironmentID: a.envID,
@@ -177,71 +213,15 @@ func (a *sdkAgent) runOnce(
 		}, nil, nil
 	}
 
-	// Send the user's prompt.
-	if _, err := a.client.Beta.Sessions.Events.Send(ctx, sess.ID, anthropic.BetaSessionEventSendParams{
-		Events: []anthropic.BetaManagedAgentsEventParamsUnion{
-			{
-				OfUserMessage: &anthropic.BetaManagedAgentsUserMessageEventParams{
-					Type: anthropic.BetaManagedAgentsUserMessageEventParamsTypeUserMessage,
-					Content: []anthropic.BetaManagedAgentsUserMessageEventParamsContentUnion{
-						{OfText: &anthropic.BetaManagedAgentsTextBlockParam{Text: prompt}},
-					},
-				},
-			},
-		},
-	}); err != nil {
-		return Transcript{
-			Markdown:     fmt.Sprintf("_failed to send user message: %s_\n", err.Error()),
-			StopReason:   StopReasonError,
-			ErrorSummary: classifyErrorMsg(err.Error()),
-		}, nil, nil
+	// Wrap the session in a transient conversation so runTurn can
+	// drive the loop without knowing whether this is OneShot or
+	// SendMessage at the call site.
+	conv := &conversation{
+		convID:    ConvID(sess.ID),
+		sessionID: sess.ID,
+		project:   project,
 	}
-
-	// Step 4: stream events, translate, drive the loop.
-	stream := a.client.Beta.Sessions.Events.StreamEvents(ctx, sess.ID, anthropic.BetaSessionEventStreamParams{})
-	defer stream.Close()
-
-	events := make(chan LoopEvent, 32)
-	go a.pumpStream(ctx, stream, events)
-
-	allow := make(map[string]bool, len(AllowedToolNames))
-	for _, n := range AllowedToolNames {
-		allow[n] = true
-	}
-
-	hooks := LoopHooks{
-		ExecuteTool: func(name string, input json.RawMessage) (string, error) {
-			handler, ok := customToolHandlers[name]
-			if !ok {
-				return "", fmt.Errorf("no handler for tool %q", name)
-			}
-			var args map[string]any
-			if err := json.Unmarshal(input, &args); err != nil {
-				return "", fmt.Errorf("decode args: %w", err)
-			}
-			return handler(args, project)
-		},
-		SendToolResult: func(toolUseID, content string, isError bool) error {
-			_, err := a.client.Beta.Sessions.Events.Send(ctx, sess.ID, anthropic.BetaSessionEventSendParams{
-				Events: []anthropic.BetaManagedAgentsEventParamsUnion{
-					{
-						OfUserCustomToolResult: &anthropic.BetaManagedAgentsUserCustomToolResultEventParams{
-							Type:            anthropic.BetaManagedAgentsUserCustomToolResultEventParamsTypeUserCustomToolResult,
-							CustomToolUseID: toolUseID,
-							Content: []anthropic.BetaManagedAgentsUserCustomToolResultEventParamsContentUnion{
-								{OfText: &anthropic.BetaManagedAgentsTextBlockParam{Text: content}},
-							},
-							IsError: param.NewOpt(isError),
-						},
-					},
-				},
-			})
-			return err
-		},
-	}
-
-	tx, invokes, err := runEventLoop(ctx, events, hooks, budget, allow)
-	return tx, invokes, err
+	return a.runTurn(ctx, conv, prompt, budget)
 }
 
 // pumpStream translates SDK union events into LoopEvents.  Closes the
