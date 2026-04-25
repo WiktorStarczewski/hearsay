@@ -1,22 +1,28 @@
-// Package agent wraps the Anthropic Managed-Agents API
-// (`client.Beta.Agents` + `client.Beta.Sessions`) for hearsay's Phase-2
-// interactive tools.
+// Package agent drives the peer-side Claude session for hearsay's
+// Phase-2 interactive tools.
 //
-// Key design points:
+// Phase-2 originally shipped via the Anthropic Managed-Agents API; PR
+// C pivoted to a subprocess driver around `claude --print` so peers
+// can use their Claude Code subscription instead of needing an
+// ANTHROPIC_API_KEY.  Key design points after the pivot:
 //
-//   - The agent runs on Ivan's box, not in Anthropic's cloud sandbox.
-//     We register read / glob / grep as **custom** tools on the
-//     Managed-Agents agent (NOT the bundled `agent_toolset_20260401`,
-//     which would route execution to an Anthropic-hosted Environment).
-//     The session emits `agent.custom_tool_use`; we execute on Ivan's
-//     filesystem and reply with `user.custom_tool_result`.
+//   - Tools execute on the peer's box.  Hearsay invokes `claude
+//     --print --allowed-tools "Read Glob Grep"` with cwd set to the
+//     project root; Claude Code itself enforces the read-only
+//     allowlist and runs the tools natively.
 //
-//   - The hearsay-side state map is metadata only — full message
-//     history lives server-side on the SDK session.
+//   - The convID is the Claude Code session UUID.  Conversation
+//     persistence lives in `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`
+//     — the same JSONL files Phase-1 reads via `read_session`.  The
+//     hearsay-side conversation map is metadata only (lastActivityAt,
+//     turnCount, system-prompt preview, etc.) and doesn't survive a
+//     restart.
 //
-//   - The event loop (loop.go) is decoupled from the SDK so unit tests
-//     can drive it with canned event streams.  sdk.go is the only place
-//     we touch the SDK directly.
+//   - cli.go holds the subprocess driver + JSON parser.  No event
+//     loop — `claude --print` is synchronous, returns one JSON
+//     result, and writes its session JSONL to disk.  We replay the
+//     JSONL after the call to extract per-tool-call detail (the
+//     stdout JSON has no `tool_calls[]` field).
 package agent
 
 import (
@@ -55,8 +61,15 @@ const (
 	ErrTimeout        ErrorSummary = "timeout"
 	ErrDisallowedTool ErrorSummary = "disallowed_tool"
 	ErrInvalidProject ErrorSummary = "invalid_project"
+	ErrClaudeMissing  ErrorSummary = "claude_missing"
 	ErrOther          ErrorSummary = "other"
 )
+
+// ErrClaudeBinMissing is returned by New() when the configured `claude`
+// binary isn't on PATH (or the explicit override path doesn't exist or
+// isn't executable).  main.go translates this into the friendly
+// startup-refusal message documented in the README.
+var ErrClaudeBinMissing = errors.New("agent: claude binary not found on PATH")
 
 // Budget bounds a single turn.  Zero means "use the server default
 // from the CLI flags."  See the plan for the cascade rules.

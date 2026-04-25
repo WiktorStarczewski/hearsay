@@ -8,9 +8,9 @@ Read a teammate's Claude Code session transcripts — and optionally drive a fre
 When a teammate (Ivan, Peter, ...) reports "my Claude did X and Y," you don't want to human-relay follow-up questions. `hearsay` runs on their machine and exposes two things to your Claude over an authenticated MCP endpoint:
 
 1. **Phase 1 — past sessions.** Their `~/.claude/projects/` (transcripts, subagent traces, tool-result sidecars) so your Claude can read what they already did. No relay, no paraphrase — primary evidence.
-2. **Phase 2 — live queries (`--enable-agent`).** A parallel Claude Agent session you can drive with `read` / `glob` / `grep` against their live filesystem, in one-shot or stateful-conversation form. Useful when their report mentions a `timeline.ndjson` you'd want to grep right now, not yesterday's conclusion. Off by default; the peer opts in by setting `--enable-agent` and an Anthropic API key.
+2. **Phase 2 — live queries (`--enable-agent`).** A parallel Claude Code session you can drive with `Read` / `Glob` / `Grep` against their live filesystem, in one-shot or stateful-conversation form. Useful when their report mentions a `timeline.ndjson` you'd want to grep right now, not yesterday's conclusion. Off by default; the peer opts in by passing `--enable-agent`. Agent calls bill against the peer's Claude Code subscription quota — no Anthropic API key required.
 
-Both modes use the same Tailscale-friendly bearer-token transport. Phase-2 tools execute on the peer's box (not in Anthropic's sandbox) and are bounded per call by token / tool-call / wall-clock budgets.
+Both modes use the same Tailscale-friendly bearer-token transport. Phase-2 tools execute on the peer's box via a `claude --print` subprocess and are bounded per call by tool-call / wall-clock budgets.
 
 ## Prerequisites
 
@@ -186,29 +186,38 @@ If you'd rather edit the config yourself, add this under `mcpServers` in `~/.cla
 
 ## Interactive mode (Phase 2)
 
-Phase-1 lets your Claude *read* your teammate's past Claude Code sessions. Phase 2 lets it *drive a fresh agent* on their machine that can read / glob / grep the live filesystem — without the teammate touching anything. Useful when you need primary data, not Ivan's after-the-fact diagnosis.
+Phase-1 lets your Claude *read* your teammate's past Claude Code sessions. Phase 2 lets it *drive a fresh Claude Code session* on their machine that can read / glob / grep the live filesystem — without the teammate touching anything. Useful when you need primary data, not Ivan's after-the-fact diagnosis.
 
-**Off by default.** A v0.2 binary without `--enable-agent` behaves bit-for-bit like v0.1.
+**Off by default.** A binary without `--enable-agent` behaves identically to Phase 1.
+
+### How it actually works
+
+`v0.3` drives a `claude --print` subprocess on the peer's machine for every agent call. **No API key is required by default** — the subprocess inherits the peer's existing Claude Code OAuth credentials and bills against their subscription (Pro / Max / Team) the same 5-hour rolling window their interactive use draws from.
+
+Architecturally:
+
+- The agent runs in a **separate, parallel** Claude Code session on the peer's machine — not the one they're typing into. It never sees the peer's interactive history; the peer's interactive Claude never sees its prompts.
+- `--allowed-tools "Read Glob Grep"` is hardcoded on every invocation. Claude Code itself enforces the read-only allowlist; hearsay doesn't dispatch tools manually.
+- The session JSONL gets written to `~/.claude/projects/<encoded-cwd>/<convId>.jsonl` like any other Claude Code session — so Phase-1's `list_sessions` / `read_session` tools surface it for post-hoc inspection.
 
 ### Enable on the peer side
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...           # Ivan's key — pays the bill
 hearsay --name ivan --enable-agent
 ```
 
-The peer must opt in; the API key is read once at startup and never logged or persisted. The cost of every call is bounded by per-turn budgets (default: 32k tokens, 20 tool calls, 120s wall-clock per call).
+That's it. Prerequisites: the peer is OAuth-logged-in to Claude Code (i.e. has run `claude` interactively at least once), and `claude` is on `PATH` (or pointed at via `--agent-claude-bin <path>`).
 
-If `--enable-agent` is set but the env var is empty, hearsay refuses to start — no half-configured state.
+If `--enable-agent` is set but `claude` isn't on `PATH`, hearsay refuses to start with a friendly error. No half-configured state.
 
 ### Use it from the consumer side
 
-After `hearsay pair <invite>` and a Claude Code restart, your Claude has one new tool per peer:
+After `hearsay pair <invite>` and a Claude Code restart, your Claude gets five new tools per peer:
 
-- `mcp__ivan__ask_peer_claude({prompt, project?, max_tokens?, max_tool_calls?, timeout_seconds?})` — spawns a parallel Claude session on Ivan's box with read-only tools (`read` / `glob` / `grep`). Returns a markdown transcript plus `{turnCount, toolCallCount, stopReason, elapsedMs}`. Short-lived; no state kept after the call.
-- `mcp__ivan__start_peer_conversation({system_prompt?, project?, ...budget})` — creates a stateful read-only conversation. Returns `{convId, startedAt, effectiveBudget}`.
+- `mcp__ivan__ask_peer_claude({prompt, project?, max_tokens?, max_tool_calls?, timeout_seconds?})` — spawns a fresh Claude Code session on Ivan's box. Returns a markdown transcript + `{turnCount, toolCallCount, stopReason, elapsedMs}`. No state kept after the call.
+- `mcp__ivan__start_peer_conversation({system_prompt?, project?, ...budget})` — creates a stateful read-only conversation. Returns `{convId, startedAt, effectiveBudget}`. The convID is the Claude Code session UUID.
 - `mcp__ivan__send_peer_message({convId, prompt, ...budget})` — one more turn on an existing conversation. Per-turn budget overrides cascade through the conversation's defaults.
-- `mcp__ivan__list_peer_conversations({})` — active conversations sorted by lastActivityAt desc.
+- `mcp__ivan__list_peer_conversations({})` — active conversations sorted by `lastActivityAt` desc.
 - `mcp__ivan__end_peer_conversation({convId})` — terminate and free the slot. Idempotent.
 
 Example natural-language prompt to your Claude:
@@ -219,32 +228,56 @@ Routes to `ask_peer_claude` automatically. To replay what Ivan already did (read
 
 ### What the peer's agent CAN'T do
 
-- Run shell commands (`bash` is **not** in the read-only allowlist).
+- Run shell commands (`Bash` is **not** in the read-only allowlist).
 - Edit / write / delete files.
 - Read files outside the project root the agent was started in.
-- Cost more than the per-call budget; runaway sessions are bounded.
 - Send messages back into Ivan's interactive Claude Code session — it's a separate parallel session, not a hijack.
+- Run for longer than the per-call wall-clock budget; runaway sessions are bounded by SIGTERM (then SIGKILL after 5 s grace).
 
-A second-leg defense rejects any `tool_use` for a name not in `{read, glob, grep}` even if the upstream emits one anyway (compromised SDK / future-version drift).
+A two-leg defense protects the allowlist: (1) `--allowed-tools "Read Glob Grep"` is the load-bearing control — Claude Code itself enforces it. (2) After every call, hearsay replays the session JSONL via the Phase-1 transcript parser and rejects the turn if any `tool_use.name` is outside the allowlist (defense-in-depth against a future-Claude-Code drift / corrupted build).
+
+### Quota & cost
+
+Agent calls consume the **peer's** Claude Code subscription quota — same 5-hour rolling window as interactive use. A noisy hearsay session and Ivan's own chat compete for the same budget. The `MaxTokens` budget is **soft** on this path (the CLI doesn't expose a token cap; we weave the value into the system prompt as a nudge). `MaxToolCalls` and `Timeout` are hard caps, enforced by the JSONL replay and the subprocess deadline respectively.
+
+### Using an API key instead of the subscription
+
+If you'd rather bill against an Anthropic API account (team account / CI runner / batch jobs), set `ANTHROPIC_API_KEY` and pass `--agent-keep-env-key`:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+hearsay --name ivan --enable-agent --agent-keep-env-key
+```
+
+The flag is **off by default** — without it, hearsay strips `ANTHROPIC_API_KEY` from the subprocess env so the subscription OAuth path always wins (avoids the silent-billing footgun where a stale env var redirects costs).
 
 ### Audit log
 
-Every agent call appends one JSON line to `~/Library/Logs/hearsay/agent.log` (macOS) or `$XDG_STATE_HOME/hearsay/agent.log` (Linux): `{timestamp, peer, convId, turnIndex, promptBytes, toolCalls: [{name, argBytes}], responseBytes, elapsedMs, stopReason, errorSummary?}`. **Sizes only — no prompt / response / tool-arg content, no hashes.** Override with `--agent-log-path <file>`.
+Every agent call appends one JSON line to `~/Library/Logs/hearsay/agent.log` (macOS) or `$XDG_STATE_HOME/hearsay/agent.log` (Linux): `{timestamp, peer, convId, turnIndex, promptBytes, toolCalls: [{name, argBytes}], responseBytes, elapsedMs, stopReason, errorSummary?, envAPIKeyHandling?}`. **Sizes only — no prompt / response / tool-arg content, no hashes.** Override with `--agent-log-path <file>`.
+
+### Known limitations
+
+- **Wrong-account auth is unverifiable.** Hearsay can't tell whether `claude` is OAuth-logged-in to the account the peer intended (work vs personal). The first agent call surfaces a "not logged in" error if it isn't logged in at all; an account mix-up bills against whatever the local session says. Sanity-check via `claude` interactively before opting in.
+- **`MaxTokens` is a soft budget.** See above — Claude Code CLI doesn't expose a token cap, so the cap rides the system prompt as a nudge. Use `--agent-default-max-tool-calls` and `--agent-default-timeout-seconds` for hard limits.
+- **Conversation metadata doesn't survive a hearsay restart.** The local map (`lastActivityAt`, `turnCount`, preview) is in-memory. The underlying Claude Code session JSONL persists, so Wiktor can still inspect a dropped conversation via Phase-1 `read_session` — just not call `send_peer_message` against it.
+- **Subprocess automation isn't explicitly endorsed in Anthropic's ToS** as of 2026-04-25. Not prohibited either. Operators should re-check before deploying widely.
 
 ### Agent flags
 
 ```
 --enable-agent                          register the agent tools (off by default)
---agent-api-key-env <NAME>              env var the API key is read from (default ANTHROPIC_API_KEY)
---agent-base-url <url>                  override Anthropic API base URL (test stubs / regional endpoints)
---agent-model <id>                      override model id (default claude-opus-4-7)
---agent-default-max-tokens <n>          per-turn token budget (default 32768)
---agent-default-max-tool-calls <n>      per-turn tool-call budget (default 20)
---agent-default-timeout-seconds <n>     per-call wall-clock budget (default 120)
+--agent-claude-bin <path>               override the `claude` binary path (default: resolve via PATH)
+--agent-keep-env-key                    keep ANTHROPIC_API_KEY in the agent subprocess env
+                                        (default: stripped so subscription OAuth wins)
+--agent-default-max-tokens <n>          soft per-turn token budget (default 32768; nudge in system prompt)
+--agent-default-max-tool-calls <n>      hard per-turn tool-call cap (default 20; via JSONL replay)
+--agent-default-timeout-seconds <n>     hard per-call wall-clock cap (default 120; subprocess deadline)
 --agent-log-path <path>                 audit log path (default platform-specific)
 --max-conversations <n>                 concurrent-conversations cap (default 10)
 --conversation-idle-timeout <dur>       reap conversations idle past this (default 15m)
 ```
+
+**Removed in v0.3** (subprocess pivot): `--agent-api-key-env`, `--agent-base-url`, `--agent-model`. Each hard-fails on use with a pointer at the new auth model.
 
 ## Optional: CLAUDE.md discoverability block
 
@@ -300,11 +333,13 @@ Phase-2 agent flags (off by default):
 
 ### Agent architecture (Phase 2)
 
-- **Tools execute on the peer's box, not in Anthropic's sandbox.** Hearsay registers `read` / `glob` / `grep` as **custom** tools on the Managed-Agents agent (NOT the bundled `agent_toolset_20260401` toolset, which would route execution to an Anthropic-hosted Environment). On every `agent.custom_tool_use` event the SDK pauses the session; hearsay executes against Ivan's filesystem and replies with `user.custom_tool_result`. This is the load-bearing architectural choice — it's why the agent can read primary data on the peer's machine at all.
-- **Read-only allowlist with two-leg adversarial defense.** The outgoing agent registration advertises *only* `{read, glob, grep}` (asserted by a unit test). Independently, the event loop rejects any inbound `agent.custom_tool_use` for a tool name not in the allowlist — even if a compromised SDK / future-version drift emits one anyway. Widening the allowlist (`bash`, `edit`, `write`) is a deliberate Phase-3 step gated on a security review, not a Phase-2 knob.
-- **Per-tool-call sandboxing.** `read` caps at 64 KB per call. `glob` and `grep` cap at 200 results. `grep` skips binary files (NUL-byte detection) and files larger than 2 MB. All three reject paths that escape the project root (`..` / symlink walks).
-- **Server-side conversation state.** The full message history of every conversation lives on the SDK session, not in hearsay. The local conversation map is metadata only — `{startedAt, lastActivityAt, turnCount, perTurnBudget, project, system_prompt preview, first user prompt preview, EndReason}`. Restarting hearsay drops the local map; live sessions on Anthropic's side outlive the restart but lose their handles. Idle conversations are reaped after `--conversation-idle-timeout` (default 15 minutes) and the upstream session is best-effort-deleted.
-- **Sizes-only audit log.** Every agent call appends one JSON line with timestamps, peer name, convId, turn index, prompt-byte-size, tool-invocation `{name, argBytes}` pairs, response-byte-size, elapsed ms, and stop reason. **No prompt, response, or tool-arg content. No hashes.** Sizes alone are sufficient for volume + latency diagnosis; that's the conservative privacy posture. Forensic replay would be a separate, opt-in `--agent-debug-log` flag with a loud warning.
-- **Bounded per call.** `--agent-default-max-tokens` (32k), `--agent-default-max-tool-calls` (20), `--agent-default-timeout-seconds` (120), `--max-conversations` (10) all cap blast radius. Per-call `Budget` overrides cascade through the conversation's defaults so a noisy turn can't drain the API key by accident.
+- **Tools execute on the peer's box via `claude --print` subprocess.** Hearsay never opens an outbound connection to api.anthropic.com itself; it spawns a fresh Claude Code session per call (or per conversation) and Claude Code talks to the API. The peer's existing OAuth credentials authenticate the calls, billing the subscription. (v0.2 used the Anthropic Managed-Agents API directly; v0.3 pivoted to subprocess so Pro / Max / Team users don't need an API key.)
+- **Read-only allowlist with two-leg adversarial defense.** Every invocation passes `--allowed-tools "Read Glob Grep"` — Claude Code itself enforces this; that's the load-bearing control. Independently, after the subprocess returns, hearsay replays the session JSONL via the Phase-1 transcript parser and rejects the turn if any `tool_use.name` is outside the allowlist (defense-in-depth against future-Claude-Code drift / corrupted builds). Widening the allowlist (`Bash`, `Edit`, `Write`) is a deliberate Phase-3 step gated on a security review, not a Phase-2 knob.
+- **Native sandboxing inherited from Claude Code.** The spawned `claude --print` runs with `cwd` set to the project root the agent was started in; Claude Code's own `Read` / `Glob` / `Grep` implementations honor that root. Hearsay no longer maintains its own per-tool caps (Phase-1 audit-grade limits like "64 KB per Read" come from Claude Code now).
+- **Conversation state persists on disk, in Claude Code's own format.** Each conversation's JSONL lives at `~/.claude/projects/<encoded-cwd>/<convId>.jsonl` — same files Phase-1 `read_session` already surfaces. Hearsay's local map (`startedAt`, `lastActivityAt`, `turnCount`, system-prompt preview) is metadata only and doesn't survive a restart, but Wiktor can still inspect a dropped conversation via `read_session` after the fact.
+- **Sizes-only audit log.** Every agent call appends one JSON line with timestamps, peer name, convId, turn index, prompt-byte-size, tool-invocation `{name, argBytes}` pairs, response-byte-size, elapsed ms, stop reason, and `envAPIKeyHandling` (which auth path billed the call). **No prompt, response, or tool-arg content. No hashes.** Sizes alone are sufficient for volume + latency diagnosis.
+- **`ANTHROPIC_API_KEY` is stripped from the subprocess env by default.** Claude Code's auth precedence is `ANTHROPIC_API_KEY > apiKeyHelper > OAuth/keychain`. To make subscription OAuth always win, hearsay strips the env var unless `--agent-keep-env-key` is passed. Avoids the silent-billing footgun where a stale API key in the operator's shell silently redirects costs.
+- **Bounded per call.** `--agent-default-max-tool-calls` (default 20, hard cap via JSONL replay), `--agent-default-timeout-seconds` (default 120, hard cap via subprocess deadline + 5 s SIGKILL grace), `--max-conversations` (default 10) all cap blast radius. `--agent-default-max-tokens` (default 32 k) is a *soft* budget on this path — the CLI doesn't expose a token cap, so the value rides the system prompt as a nudge.
 - **Same transport as Phase 1.** Phase-2 tools register alongside the existing eight on the same `mcp.Server` instance. Tailnet binding, bearer token, claude-md discoverability, and the rest of the operational story are unchanged.
+- **No Anthropic SDK dependency.** v0.3 dropped `github.com/anthropics/anthropic-sdk-go` and its transitive deps; the static binary's supply-chain footprint shrank meaningfully. The `claude` binary is the single new runtime dependency, and Phase 1 already required it (Claude Code is what writes the JSONL transcripts hearsay reads).
 

@@ -140,8 +140,8 @@ func TestAskPeerClaude_RegistersWhenAgentSet(t *testing.T) {
 	for tool := range cs.Tools(ctx, nil) {
 		if tool.Name == "ask_peer_claude" {
 			found = true
-			if !strings.Contains(tool.Description, "parallel Claude session") {
-				t.Errorf("description must include 'parallel Claude session' for routing disambiguation")
+			if !strings.Contains(tool.Description, "parallel Claude Code subprocess") {
+				t.Errorf("description must include 'parallel Claude Code subprocess' for routing disambiguation")
 			}
 			if !strings.Contains(tool.Description, "Ivan") {
 				t.Errorf("description should bake the peer name in (testCtx uses 'ivan')")

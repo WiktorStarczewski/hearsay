@@ -34,12 +34,13 @@ type AskPeerClaudeOutput struct {
 func addAskPeerClaude(s *mcp.Server, ctx Context) {
 	peer := capName(ctx.PeerName)
 	desc := fmt.Sprintf(
-		"Spawns a NEW parallel Claude session on %s's machine with read-only filesystem tools (read / glob / grep) "+
-			"and asks it `prompt`. Use this when you need %s's filesystem inspected RIGHT NOW — running fresh queries "+
-			"against fresh data. This is NOT the Claude session %s is currently typing into; it cannot send messages "+
-			"to %s and they won't see it. To replay what %s already did (read past transcripts), use list_sessions / "+
-			"read_session instead. Returns a markdown transcript plus {turnCount, toolCallCount, stopReason, elapsedMs}.",
-		peer, peer, peer, peer, peer,
+		"Spawns a NEW parallel Claude Code subprocess on %s's machine with read-only filesystem tools (Read / Glob / Grep) "+
+			"and asks it `prompt`. The call bills against %s's Claude Code subscription quota. Use this when you need %s's "+
+			"filesystem inspected RIGHT NOW — running fresh queries against fresh data. This is NOT the Claude session "+
+			"%s is currently typing into; it cannot send messages to %s and they won't see it. To replay what %s already "+
+			"did (read past transcripts), use list_sessions / read_session instead. Returns a markdown transcript plus "+
+			"{turnCount, toolCallCount, stopReason, elapsedMs}.",
+		peer, peer, peer, peer, peer, peer,
 	)
 	mcp.AddTool(s, &mcp.Tool{Name: "ask_peer_claude", Description: desc},
 		trace(ctx, "ask_peer_claude", func(c context.Context, _ *mcp.CallToolRequest, in AskPeerClaudeInput) (*mcp.CallToolResult, AskPeerClaudeOutput, error) {
@@ -103,11 +104,11 @@ type StartPeerConversationOutput struct {
 func addStartPeerConversation(s *mcp.Server, ctx Context) {
 	peer := capName(ctx.PeerName)
 	desc := fmt.Sprintf(
-		"Starts a stateful read-only conversation with a NEW parallel Claude session on %s's machine, separate from "+
-			"any session %s is currently typing into. Returns {convId, startedAt, effectiveBudget}; pass convId to "+
-			"send_peer_message for follow-ups so context isn't re-paid each turn. Use ask_peer_claude for one-off "+
-			"questions; use this when you expect 2+ follow-up turns.",
-		peer, peer,
+		"Starts a stateful read-only conversation backed by a Claude Code subprocess on %s's machine, separate from "+
+			"any session %s is currently typing into. Bills against %s's Claude Code subscription quota. Returns "+
+			"{convId, startedAt, effectiveBudget}; pass convId to send_peer_message for follow-ups so context isn't "+
+			"re-paid each turn. Use ask_peer_claude for one-off questions; use this when you expect 2+ follow-up turns.",
+		peer, peer, peer,
 	)
 	mcp.AddTool(s, &mcp.Tool{Name: "start_peer_conversation", Description: desc},
 		trace(ctx, "start_peer_conversation", func(c context.Context, _ *mcp.CallToolRequest, in StartPeerConversationInput) (*mcp.CallToolResult, StartPeerConversationOutput, error) {

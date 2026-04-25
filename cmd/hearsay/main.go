@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
@@ -28,7 +29,7 @@ import (
 
 // version is overridable at build time via:
 //   go build -ldflags "-X main.version=<tag>" ./cmd/hearsay
-var version = "0.1.0-dev"
+var version = "0.3.0-dev"
 
 func main() {
 	os.Exit(dispatch(os.Args[1:]))
@@ -104,16 +105,21 @@ SERVER FLAGS
 
 PHASE-2 AGENT FLAGS (off by default)
   --enable-agent            register interactive tools (ask_peer_claude, …)
-  --agent-api-key-env <NM>  env var the Anthropic API key is read from (default ANTHROPIC_API_KEY)
-  --agent-base-url <url>    override Anthropic API base URL (test stubs / regional endpoints)
-  --agent-model <id>        override the Anthropic model id (default claude-opus-4-7)
-  --agent-default-max-tokens <n>        per-turn token budget (default 32768)
-  --agent-default-max-tool-calls <n>    per-turn tool-call budget (default 20)
-  --agent-default-timeout-seconds <n>   per-call wall-clock budget in seconds (default 120)
+  --agent-claude-bin <path> override the 'claude' binary path (default: resolve via PATH)
+  --agent-keep-env-key      keep ANTHROPIC_API_KEY in the agent subprocess env
+                            (default: stripped so subscription OAuth wins)
+  --agent-default-max-tokens <n>        soft per-turn token budget (default 32768; nudge in system prompt)
+  --agent-default-max-tool-calls <n>    hard per-turn tool-call cap (default 20; via JSONL replay)
+  --agent-default-timeout-seconds <n>   hard per-call wall-clock cap (default 120; subprocess deadline)
   --agent-log-path <path>   audit log (default: ~/Library/Logs/hearsay/agent.log on macOS,
                             $XDG_STATE_HOME/hearsay/agent.log elsewhere)
   --max-conversations <n>   concurrent-conversations cap (default 10)
   --conversation-idle-timeout <dur>     reap conversations idle past this (default 15m)
+
+REMOVED in v0.3 (subprocess pivot — agent uses Claude Code subscription OAuth, not API keys)
+  --agent-api-key-env, --agent-base-url, --agent-model
+                            Each hard-fails on use; pass --agent-keep-env-key to keep
+                            ANTHROPIC_API_KEY for an opt-in API-key path.
 
 ADD-PEER FLAGS
   --url <url>               peer's hearsay MCP URL (e.g. http://ivan-mac.tailXXXX.ts.net:3456/mcp)
@@ -152,21 +158,45 @@ func runServerWithSignals(args []string, sigCh <-chan os.Signal) int {
 		quiet           = fs.Bool("quiet", false, "suppress tool-call logs")
 
 		// --- Phase-2 agent flags. All gated by --enable-agent; off by
-		// default so a Phase-1 install upgrading to a v0.2 binary
-		// behaves bit-for-bit like before until the operator opts in.
+		// default so an existing install upgrading to v0.3 behaves
+		// bit-for-bit like before until the operator opts in.
 		enableAgent     = fs.Bool("enable-agent", false, "enable Phase-2 interactive agent tools (ask_peer_claude, etc.)")
-		agentAPIKeyEnv  = fs.String("agent-api-key-env", "ANTHROPIC_API_KEY", "env var the Anthropic API key is read from")
-		agentBaseURL    = fs.String("agent-base-url", "", "override Anthropic API base URL (test stubs / regional endpoints)")
-		agentModel      = fs.String("agent-model", "", "override the Anthropic model id (default claude-opus-4-7)")
-		agentMaxTokens  = fs.Int("agent-default-max-tokens", 32768, "default per-turn max_tokens budget")
-		agentMaxTools   = fs.Int("agent-default-max-tool-calls", 20, "default per-turn max_tool_calls budget")
-		agentTimeoutSec = fs.Int("agent-default-timeout-seconds", 120, "default per-call wall-clock budget in seconds")
+		agentClaudeBin  = fs.String("agent-claude-bin", "", "path to the `claude` binary (default: resolve via PATH)")
+		agentKeepEnvKey = fs.Bool("agent-keep-env-key", false, "keep ANTHROPIC_API_KEY in the agent subprocess env (default: stripped so subscription OAuth wins)")
+		agentMaxTokens  = fs.Int("agent-default-max-tokens", 32768, "default per-turn max_tokens budget (soft — woven into system prompt as a nudge)")
+		agentMaxTools   = fs.Int("agent-default-max-tool-calls", 20, "default per-turn max_tool_calls budget (hard — enforced via JSONL replay)")
+		agentTimeoutSec = fs.Int("agent-default-timeout-seconds", 120, "default per-call wall-clock budget in seconds (hard — subprocess deadline)")
 		agentLogPath    = fs.String("agent-log-path", "", "audit-log path (default: platform-specific — see DefaultAuditPath)")
 		maxConvs        = fs.Int("max-conversations", 10, "concurrent-conversations cap")
 		convIdle        = fs.Duration("conversation-idle-timeout", 15*time.Minute, "reap conversations idle past this duration")
+
+		// Removed in v0.3 (subprocess pivot — see CHANGELOG / README).
+		// We keep the flags registered so the parser doesn't reject
+		// them; the handler below issues a friendly hard-fail when
+		// they're explicitly used.  Empty string / nil sentinel means
+		// "operator did not pass it."
+		agentAPIKeyEnvDeprecated = fs.String("agent-api-key-env", "", "REMOVED in v0.3 — agent uses Claude Code subscription OAuth (see --agent-keep-env-key)")
+		agentBaseURLDeprecated   = fs.String("agent-base-url", "", "REMOVED in v0.3 — Claude Code knows its own base URL")
+		agentModelDeprecated     = fs.String("agent-model", "", "REMOVED in v0.3 — model selection is configured on the peer's claude install")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+
+	// Hard-fail on any of the v0.2-era removed flags being explicitly
+	// set.  Auth model flipped silently is a bigger footgun than a
+	// noisy script failure; see plan section "Failure on removed flags".
+	if removed, ok := firstSetDeprecatedFlag(map[string]string{
+		"--agent-api-key-env": *agentAPIKeyEnvDeprecated,
+		"--agent-base-url":    *agentBaseURLDeprecated,
+		"--agent-model":       *agentModelDeprecated,
+	}); ok {
+		fmt.Fprintf(os.Stderr,
+			"hearsay: %s was removed in v0.3 — agent calls now use the peer's Claude Code subscription via OAuth.\n"+
+				"See README \"Interactive mode (Phase 2)\" for the new auth model.\n"+
+				"To bill against an API key instead, set ANTHROPIC_API_KEY and pass --agent-keep-env-key.\n",
+			removed)
+		return 1
 	}
 
 	// Resolve config (possibly first-run or token rotation).
@@ -179,19 +209,12 @@ func runServerWithSignals(args []string, sigCh <-chan os.Signal) int {
 		return 1
 	}
 
-	// If --enable-agent was set, we MUST have an API key before we bind
-	// the listener; refusing to start avoids a half-configured server
-	// where ask_peer_claude is registered but every call fails.
+	// If --enable-agent was set, we MUST have a usable `claude`
+	// binary before we bind the listener; refusing to start avoids a
+	// half-configured server where ask_peer_claude is registered but
+	// every call fails.
 	var ag agent.Agent
 	if *enableAgent {
-		envName := *agentAPIKeyEnv
-		key := os.Getenv(envName)
-		if key == "" {
-			fmt.Fprintf(os.Stderr,
-				"hearsay: --enable-agent set but %s is empty (override the env var name with --agent-api-key-env)\n",
-				envName)
-			return 1
-		}
 		auditPath := *agentLogPath
 		if auditPath == "" {
 			auditPath = agent.DefaultAuditPath()
@@ -201,11 +224,19 @@ func runServerWithSignals(args []string, sigCh <-chan os.Signal) int {
 			fmt.Fprintf(os.Stderr, "hearsay: agent audit log: %v\n", err)
 			return 1
 		}
+
+		dataDirForAgent := *dataDir
+		if dataDirForAgent == "" {
+			if home, err := os.UserHomeDir(); err == nil {
+				dataDirForAgent = filepath.Join(home, ".claude")
+			}
+		}
+
 		ag, err = agent.New(agent.Config{
-			APIKey:   key,
-			BaseURL:  *agentBaseURL,
-			Model:    *agentModel,
-			PeerName: resolved.Config.Name,
+			ClaudeBin:     *agentClaudeBin,
+			PeerName:      resolved.Config.Name,
+			KeepEnvAPIKey: *agentKeepEnvKey,
+			DataDir:       dataDirForAgent,
 			DefaultBudget: agent.Budget{
 				MaxTokens:    *agentMaxTokens,
 				MaxToolCalls: *agentMaxTools,
@@ -216,10 +247,25 @@ func runServerWithSignals(args []string, sigCh <-chan os.Signal) int {
 			ConversationIdleTimeout: *convIdle,
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "hearsay: agent init: %v\n", err)
+			if errors.Is(err, agent.ErrClaudeBinMissing) {
+				fmt.Fprintf(os.Stderr,
+					"hearsay: --enable-agent set but 'claude' is not on PATH\n"+
+						"  (use --agent-claude-bin to override the path; install Claude Code from https://claude.com/claude-code)\n"+
+						"  detail: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "hearsay: agent init: %v\n", err)
+			}
 			return 1
 		}
-		fmt.Fprintf(os.Stderr, "agent enabled (key: %s)  audit log: %s\n", maskKey(key), auditPath)
+		// One last warning if the operator has ANTHROPIC_API_KEY set
+		// without --agent-keep-env-key — the subprocess will silently
+		// strip it, but make the strip visible.
+		if !*agentKeepEnvKey && os.Getenv("ANTHROPIC_API_KEY") != "" {
+			fmt.Fprintln(os.Stderr,
+				"hearsay: stripping ANTHROPIC_API_KEY from agent subprocess env (would override subscription OAuth). "+
+					"Pass --agent-keep-env-key to keep it.")
+		}
+		fmt.Fprintf(os.Stderr, "agent enabled (claude: %s)  audit log: %s\n", *agentClaudeBin, auditPath)
 	}
 
 	effectiveBind := *bind
@@ -278,15 +324,29 @@ func runServerWithSignals(args []string, sigCh <-chan os.Signal) int {
 	return 0
 }
 
-// maskKey returns a privacy-safe rendering of an Anthropic API key for
-// startup logs.  Shows the first few chars + last four of the key so
-// the operator can identify which key is loaded without leaking the
-// secret in case the log file is shared.
-func maskKey(k string) string {
-	if len(k) <= 12 {
-		return "***"
+// firstSetDeprecatedFlag returns the first flag name in `flags` whose
+// value is non-empty, plus an "ok" boolean.  Used by the v0.3 hard-fail
+// on removed flags (see plan section "Failure on removed flags").  The
+// iteration order of the map is non-deterministic but each call still
+// only emits the *first* offending flag, which is what the operator needs.
+func firstSetDeprecatedFlag(flags map[string]string) (string, bool) {
+	// Stable iteration: alphabetical so error messages are reproducible
+	// across runs.
+	names := make([]string, 0, len(flags))
+	for name := range flags {
+		names = append(names, name)
 	}
-	return k[:7] + "...." + k[len(k)-4:]
+	for i := 1; i < len(names); i++ {
+		for j := i; j > 0 && names[j-1] > names[j]; j-- {
+			names[j-1], names[j] = names[j], names[j-1]
+		}
+	}
+	for _, name := range names {
+		if flags[name] != "" {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 // isAddrInUse treats EADDRINUSE specially so the operator gets a

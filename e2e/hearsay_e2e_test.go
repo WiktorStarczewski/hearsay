@@ -709,9 +709,22 @@ func startServerWithEnv(t *testing.T, name string, extraArgs []string, extraEnv 
 	}
 }
 
+// fakeClaudeBin writes a no-op `claude` shell script to a fresh temp
+// dir, returning the absolute path.  Used by the agent-enabled e2e
+// tests so the binary doesn't refuse to start on missing PATH.
+func fakeClaudeBin(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "claude")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("fake claude: %v", err)
+	}
+	return path
+}
+
 // TestE2E_AgentToolAbsentWhenDisabled confirms the off-by-default
-// gating: a Phase-1 install upgrading to a v0.2 binary without
-// --enable-agent sees the same 8-tool surface as before.
+// gating: an existing install upgrading to v0.3 without --enable-agent
+// sees the same 8-tool surface as before.
 func TestE2E_AgentToolAbsentWhenDisabled(t *testing.T) {
 	f := startServer(t, "agent-off")
 	cs := f.connectMCP(t)
@@ -723,25 +736,21 @@ func TestE2E_AgentToolAbsentWhenDisabled(t *testing.T) {
 }
 
 // TestE2E_AgentToolPresentWhenEnabled confirms the positive: with
-// --enable-agent and a (dummy) API key, ask_peer_claude is registered
-// and its description carries the routing-disambiguation language.
+// --enable-agent and a usable `claude` (the fake stub), ask_peer_claude
+// is registered and its description carries the routing-disambiguation
+// language.
 func TestE2E_AgentToolPresentWhenEnabled(t *testing.T) {
+	stub := fakeClaudeBin(t)
 	f := startServerWithEnv(t, "agent-on",
-		[]string{"--enable-agent", "--quiet"},
-		[]string{
-			"ANTHROPIC_API_KEY=sk-ant-fake-test-key-12345",
-			// agent.New does NOT call out to Anthropic at construction
-			// time — the API key is just cached.  Lazy Environment+Agent
-			// creation happens on first OneShot call, which we don't
-			// trigger in this test.
-		},
+		[]string{"--enable-agent", "--agent-claude-bin", stub, "--quiet"},
+		nil,
 	)
 	cs := f.connectMCP(t)
 	found := false
 	for tool := range cs.Tools(context.Background(), nil) {
 		if tool.Name == "ask_peer_claude" {
 			found = true
-			if !strings.Contains(tool.Description, "parallel Claude session") {
+			if !strings.Contains(tool.Description, "parallel Claude Code subprocess") {
 				t.Errorf("description must include disambiguation language; got %q", tool.Description)
 			}
 		}
@@ -754,9 +763,10 @@ func TestE2E_AgentToolPresentWhenEnabled(t *testing.T) {
 // TestE2E_ConversationToolsPresent confirms all four PR-B
 // conversation tools are in the catalog when --enable-agent is set.
 func TestE2E_ConversationToolsPresent(t *testing.T) {
+	stub := fakeClaudeBin(t)
 	f := startServerWithEnv(t, "conv-tools",
-		[]string{"--enable-agent", "--quiet"},
-		[]string{"ANTHROPIC_API_KEY=sk-ant-fake-test-key-12345"},
+		[]string{"--enable-agent", "--agent-claude-bin", stub, "--quiet"},
+		nil,
 	)
 	cs := f.connectMCP(t)
 	want := map[string]bool{
@@ -779,18 +789,20 @@ func TestE2E_ConversationToolsPresent(t *testing.T) {
 
 // TestE2E_ConversationCapFlagWiredThrough confirms the
 // --max-conversations flag reaches the agent layer.  We can't actually
-// fill the cap without standing up a full Anthropic stub, but we CAN
-// confirm `list_peer_conversations` returns an empty list (proving the
-// agent state map is wired) and that the binary accepts the flag.
+// fill the cap without standing up a full Anthropic-side stub, but we
+// CAN confirm `list_peer_conversations` returns an empty list (proving
+// the agent state map is wired) and that the binary accepts the flag.
 func TestE2E_ConversationCapFlagWiredThrough(t *testing.T) {
+	stub := fakeClaudeBin(t)
 	f := startServerWithEnv(t, "conv-cap",
 		[]string{
 			"--enable-agent",
+			"--agent-claude-bin", stub,
 			"--quiet",
 			"--max-conversations", "2",
 			"--conversation-idle-timeout", "5s",
 		},
-		[]string{"ANTHROPIC_API_KEY=sk-ant-fake-test-key-12345"},
+		nil,
 	)
 	cs := f.connectMCP(t)
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
@@ -813,35 +825,34 @@ func TestE2E_ConversationCapFlagWiredThrough(t *testing.T) {
 	}
 }
 
-// TestE2E_AgentRefusesStartWithoutKey confirms the error-contract row:
-// `--enable-agent` set but ANTHROPIC_API_KEY empty ⇒ refuse to start.
-// We can't use startServerWithEnv (it waits for /health) — the binary
-// is supposed to exit before binding.  Drive `exec.Cmd` directly.
-func TestE2E_AgentRefusesStartWithoutKey(t *testing.T) {
+// TestE2E_AgentRefusesStartWithoutClaudeBin confirms the v0.3
+// error-contract row: `--enable-agent` set but `claude` not on PATH ⇒
+// refuse to start, with a friendly error mentioning --agent-claude-bin.
+func TestE2E_AgentRefusesStartWithoutClaudeBin(t *testing.T) {
 	home := t.TempDir()
 	dataDir := t.TempDir()
 	cmd := exec.Command(binaryPath,
-		"--name", "agent-noenv",
+		"--name", "agent-noclaude",
 		"--port", "0",
 		"--bind", "127.0.0.1",
 		"--data-dir", dataDir,
 		"--enable-agent",
 		"--quiet",
 	)
-	cmd.Env = append(os.Environ(),
-		"HOME="+home,
+	cmd.Env = []string{
+		"HOME=" + home,
 		"XDG_CONFIG_HOME=",
-		"ANTHROPIC_API_KEY=",
-	)
+		"PATH=", // strip PATH so claude can't be resolved
+	}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	cmd.Stdout = io.Discard
 	err := cmd.Run()
 	if err == nil {
-		t.Fatalf("expected hearsay --enable-agent to fail without a key; stderr was: %s", stderr.String())
+		t.Fatalf("expected hearsay --enable-agent to fail without claude on PATH; stderr was: %s", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "ANTHROPIC_API_KEY") {
-		t.Errorf("stderr should mention ANTHROPIC_API_KEY; got: %s", stderr.String())
+	if !strings.Contains(stderr.String(), "claude") || !strings.Contains(stderr.String(), "--agent-claude-bin") {
+		t.Errorf("stderr should mention claude + --agent-claude-bin; got: %s", stderr.String())
 	}
 }
 
