@@ -369,21 +369,28 @@ type ReadToolResultInput struct {
 	MaxBytes  int    `json:"maxBytes,omitempty" jsonschema:"default 65536"`
 }
 
-// ReadToolResultOutput intentionally mirrors the content so the schema
-// includes enough for a calling Claude to understand the shape, but the
-// real payload is returned as a text Content block so it isn't stringified
-// into a JSON-escaped blob.
-type ReadToolResultOutput struct {
-	SessionID string `json:"sessionId"`
-	ToolUseID string `json:"toolUseId"`
-	Source    string `json:"source"` // "sidecar" or "inline"
-	Truncated bool   `json:"truncated"`
-	Bytes     int    `json:"bytes"`
-}
+// ReadToolResultOutput is intentionally empty in PR 0.
+//
+// Phase 1 returned the body in a TextContent block AND a populated
+// StructuredContent block ({source, truncated, bytes}). Some MCP consumers
+// surfaced only the structured channel back to the calling model, which
+// experienced as "metadata-only" reads against large sidecars. To make the
+// body the unconditional source of truth, the metadata is now inlined as a
+// leading line in the body text:
+//
+//	[source=sidecar, bytes=12345, truncated=false]
+//
+//	<actual content...>
+//
+// The other Phase-1 tools keep markdown + StructuredContent metadata —
+// this is a targeted exception, not a deprecation of the convention.
+type ReadToolResultOutput struct{}
 
 func addReadToolResult(s *mcp.Server, ctx Context) {
 	desc := "Fetch the full content of a tool result (typically a Read output or long command stdout) by toolUseId. " +
-		"Returns the raw text as a content block, capped at maxBytes (default 64KB)."
+		"Returns the raw text as a single content block, capped at maxBytes (default 64KB). The first line of the " +
+		"returned text is a metadata header in the form `[source=<sidecar|inline>, bytes=N, truncated=<bool>]`, " +
+		"followed by a blank line, followed by the body."
 	mcp.AddTool(s, &mcp.Tool{Name: "read_tool_result", Description: desc},
 		trace(ctx, "read_tool_result", func(_ context.Context, _ *mcp.CallToolRequest, in ReadToolResultInput) (*mcp.CallToolResult, ReadToolResultOutput, error) {
 			path := transcript.FindSessionPath(in.SessionID, ctx.DataDir)
@@ -422,15 +429,10 @@ func addReadToolResult(s *mcp.Server, ctx Context) {
 				truncated = true
 			}
 
+			header := fmt.Sprintf("[source=%s, bytes=%d, truncated=%t]\n\n", source, len(body), truncated)
 			return &mcp.CallToolResult{
-					Content: []mcp.Content{&mcp.TextContent{Text: body}},
-				}, ReadToolResultOutput{
-					SessionID: in.SessionID,
-					ToolUseID: in.ToolUseID,
-					Source:    source,
-					Truncated: truncated,
-					Bytes:     len(body),
-				}, nil
+				Content: []mcp.Content{&mcp.TextContent{Text: header + body}},
+			}, ReadToolResultOutput{}, nil
 		}))
 }
 
