@@ -209,7 +209,20 @@ func (a *cliAgent) runClaude(ctx context.Context, r runReq) (Transcript, []Audit
 
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, a.cfg.ClaudeBin, args...)
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	// Run in its own process group so SIGTERM reaches every child the
+	// subprocess spawns (e.g. a shell script that backgrounds work).
+	// On Linux, the default behavior of `sh` is NOT to forward SIGTERM
+	// to a child sleep / claude binary; the group-kill fixes that.
+	setProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		// Negative pid = "this process group", so the SIGTERM hits
+		// every descendant.  Falls back to the process itself if
+		// process-group setup wasn't supported (e.g. Windows).
+		if pgid, err := getProcessGroup(cmd); err == nil {
+			return syscall.Kill(-pgid, syscall.SIGTERM)
+		}
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
 	cmd.WaitDelay = subprocessGracePeriod
 	cmd.Dir = r.conv.project
 	cmd.Env = env
