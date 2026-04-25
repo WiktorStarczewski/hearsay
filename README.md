@@ -3,15 +3,20 @@
 [![ci](https://github.com/WiktorStarczewski/hearsay/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/WiktorStarczewski/hearsay/actions/workflows/ci.yml?query=branch%3Amain)
 [![coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/WiktorStarczewski/hearsay/badges/coverage.json)](https://github.com/WiktorStarczewski/hearsay/actions/workflows/ci.yml?query=branch%3Amain)
 
-Read a teammate's Claude Code session transcripts over an MCP bridge.
+Read a teammate's Claude Code session transcripts — and optionally drive a fresh read-only agent on their box — over an authenticated MCP bridge.
 
-When a teammate (Ivan, Peter, ...) reports "my Claude did X and Y," you don't want to human-relay follow-up questions. `hearsay` runs on their machine, exposes their `~/.claude/projects/` over an authenticated MCP endpoint, and your Claude reads the transcript directly. No relay, no paraphrase — primary evidence.
+When a teammate (Ivan, Peter, ...) reports "my Claude did X and Y," you don't want to human-relay follow-up questions. `hearsay` runs on their machine and exposes two things to your Claude over an authenticated MCP endpoint:
+
+1. **Phase 1 — past sessions.** Their `~/.claude/projects/` (transcripts, subagent traces, tool-result sidecars) so your Claude can read what they already did. No relay, no paraphrase — primary evidence.
+2. **Phase 2 — live queries (`--enable-agent`).** A parallel Claude Agent session you can drive with `read` / `glob` / `grep` against their live filesystem, in one-shot or stateful-conversation form. Useful when their report mentions a `timeline.ndjson` you'd want to grep right now, not yesterday's conclusion. Off by default; the peer opts in by setting `--enable-agent` and an Anthropic API key.
+
+Both modes use the same Tailscale-friendly bearer-token transport. Phase-2 tools execute on the peer's box (not in Anthropic's sandbox) and are bounded per call by token / tool-call / wall-clock budgets.
 
 ## Prerequisites
 
 Both sides — the teammate running the server and the reader consuming it — need:
 
-- **[Go](https://go.dev/dl/) ≥ 1.25** — `brew install go` on macOS. Required to `go install` the binary.
+- **[Go](https://go.dev/dl/) ≥ 1.26** — `brew install go` on macOS. Required to `go install` the binary.
 - **[Claude Code](https://claude.com/claude-code)** — the whole point is bridging two Claude Code sessions. Teammates need it running so there's something to read; readers need it to consume the MCP tools. Install via `npm install -g @anthropic-ai/claude-code` or see the official docs.
 
 For anything beyond loopback (reader and server on the same machine), you also need a network path between the two machines:
@@ -93,7 +98,7 @@ You can accept shares from any number of teammates. Each stays on their own tail
 go install github.com/WiktorStarczewski/hearsay/cmd/hearsay@latest
 ```
 
-Requires Go ≥ 1.25. Single static binary; installs to `$(go env GOBIN)` (usually `~/go/bin`).
+Requires Go ≥ 1.26. Single static binary; installs to `$(go env GOBIN)` (usually `~/go/bin`).
 
 ## Run (teammate side)
 
@@ -124,7 +129,7 @@ Ivan sends that line to Wiktor over a secret channel (1Password, Signal). When T
 hearsay pair hearsay://ivan@ivan-mac.tailXXXX.ts.net:3456/mcp?token=abc123...
 ```
 
-That's it — `pair` writes the `mcpServers` entry into `~/.claude.json` via `claude mcp add --scope user`. Restart Claude Code; `/mcp` should list `ivan` with 8 tools.
+That's it — `pair` writes the `mcpServers` entry into `~/.claude.json` via `claude mcp add --scope user`. Restart Claude Code; `/mcp` should list `ivan` with 8 read-only tools (or 13 if Ivan started with `--enable-agent`).
 
 ### Install via a Claude prompt
 
@@ -285,8 +290,21 @@ Phase-2 agent flags (off by default):
 
 ## Design notes
 
+### Routing & transcripts (Phase 1)
+
 - Each `hearsay` instance is named (`--name ivan`). The name is baked into every tool description at registration time, so Claude Code's natural routing (user mentions "Ivan" → `mcp__ivan__*` tools) works without any consumer-side config.
 - `get_current_session` returns an explicit `ambiguous` field rather than silently picking among multiple live sessions. The tool description tells the calling Claude to ASK the user when ambiguous.
 - The JSONL parser tolerates truncated last lines (active sessions mid-write) and unknown event types (forward-compat).
 - Tool-result sidecar paths are extracted by regex from the inline message content — the sidecar filename is *not* the `tool_use.id`.
+- `read_tool_result` returns a single TextContent block with the metadata inlined as a leading line (`[source=…, bytes=…, truncated=…]`) rather than a separate `StructuredContent` block. Some MCP consumers were surfacing only the structured channel back to the calling model, which experienced as "metadata-only" reads against large sidecars.
+
+### Agent architecture (Phase 2)
+
+- **Tools execute on the peer's box, not in Anthropic's sandbox.** Hearsay registers `read` / `glob` / `grep` as **custom** tools on the Managed-Agents agent (NOT the bundled `agent_toolset_20260401` toolset, which would route execution to an Anthropic-hosted Environment). On every `agent.custom_tool_use` event the SDK pauses the session; hearsay executes against Ivan's filesystem and replies with `user.custom_tool_result`. This is the load-bearing architectural choice — it's why the agent can read primary data on the peer's machine at all.
+- **Read-only allowlist with two-leg adversarial defense.** The outgoing agent registration advertises *only* `{read, glob, grep}` (asserted by a unit test). Independently, the event loop rejects any inbound `agent.custom_tool_use` for a tool name not in the allowlist — even if a compromised SDK / future-version drift emits one anyway. Widening the allowlist (`bash`, `edit`, `write`) is a deliberate Phase-3 step gated on a security review, not a Phase-2 knob.
+- **Per-tool-call sandboxing.** `read` caps at 64 KB per call. `glob` and `grep` cap at 200 results. `grep` skips binary files (NUL-byte detection) and files larger than 2 MB. All three reject paths that escape the project root (`..` / symlink walks).
+- **Server-side conversation state.** The full message history of every conversation lives on the SDK session, not in hearsay. The local conversation map is metadata only — `{startedAt, lastActivityAt, turnCount, perTurnBudget, project, system_prompt preview, first user prompt preview, EndReason}`. Restarting hearsay drops the local map; live sessions on Anthropic's side outlive the restart but lose their handles. Idle conversations are reaped after `--conversation-idle-timeout` (default 15 minutes) and the upstream session is best-effort-deleted.
+- **Sizes-only audit log.** Every agent call appends one JSON line with timestamps, peer name, convId, turn index, prompt-byte-size, tool-invocation `{name, argBytes}` pairs, response-byte-size, elapsed ms, and stop reason. **No prompt, response, or tool-arg content. No hashes.** Sizes alone are sufficient for volume + latency diagnosis; that's the conservative privacy posture. Forensic replay would be a separate, opt-in `--agent-debug-log` flag with a loud warning.
+- **Bounded per call.** `--agent-default-max-tokens` (32k), `--agent-default-max-tool-calls` (20), `--agent-default-timeout-seconds` (120), `--max-conversations` (10) all cap blast radius. Per-call `Budget` overrides cascade through the conversation's defaults so a noisy turn can't drain the API key by accident.
+- **Same transport as Phase 1.** Phase-2 tools register alongside the existing eight on the same `mcp.Server` instance. Tailnet binding, bearer token, claude-md discoverability, and the rest of the operational story are unchanged.
 
