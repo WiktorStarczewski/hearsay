@@ -269,28 +269,43 @@ func TestOneShot_RejectsInvalidProject(t *testing.T) {
 }
 
 // stubAnthropicServer responds with minimal-valid JSON for the
-// non-streaming endpoints the conversation lifecycle hits, and a 5xx
-// for StreamEvents.  Every test that needs a live SDK round-trip can
-// reuse this rather than re-defining it.  Sessions get unique IDs so
-// the cap test can rely on the local-state map keying being honest.
+// non-streaming endpoints the conversation lifecycle hits, and a
+// proper-but-empty SSE response for StreamEvents.  An empty stream
+// closes immediately, which translates to EndTurn at the loop layer
+// (channel-close case) without depending on race-detector timing.
+//
+// Sessions get unique IDs so the cap test can rely on the local-state
+// map keying being honest.
 func stubAnthropicServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	var sessSeq int32
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/v1/environments" && r.Method == "POST":
+			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"env-1","name":"hearsay-test","type":"environment","created_at":"2026-04-25T00:00:00Z","updated_at":"2026-04-25T00:00:00Z","status":"ready"}`))
 		case r.URL.Path == "/v1/agents" && r.Method == "POST":
+			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"agent-1","name":"hearsay-test","type":"agent","version":1,"created_at":"2026-04-25T00:00:00Z","updated_at":"2026-04-25T00:00:00Z","model":{"id":"claude-opus-4-7"}}`))
 		case r.URL.Path == "/v1/sessions" && r.Method == "POST":
+			w.Header().Set("Content-Type", "application/json")
 			id := atomic.AddInt32(&sessSeq, 1)
 			_, _ = fmt.Fprintf(w, `{"id":"sess-%d","type":"session","agent":{"id":"agent-1","type":"agent","version":1},"environment_id":"env-1","status":"running","created_at":"2026-04-25T00:00:00Z","updated_at":"2026-04-25T00:00:00Z"}`, id)
 		case strings.HasPrefix(r.URL.Path, "/v1/sessions/") && r.Method == "DELETE":
+			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"sess-deleted","type":"session","status":"deleted"}`))
+		case strings.Contains(r.URL.Path, "/events/stream") || (strings.Contains(r.URL.Path, "/events") && r.Method == "GET"):
+			// Empty SSE response — stream closes immediately, no
+			// events delivered.  The loop will see `<-events` close
+			// and return StopReasonEndTurn.
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
 		case strings.Contains(r.URL.Path, "/events") && r.Method == "POST":
+			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"events":[]}`))
 		default:
+			w.Header().Set("Content-Type", "application/json")
 			http.Error(w, `{"type":"error","error":{"type":"api_error","message":"stub deliberate failure"}}`, http.StatusServiceUnavailable)
 		}
 	}))
