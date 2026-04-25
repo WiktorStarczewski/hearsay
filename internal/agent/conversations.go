@@ -2,54 +2,48 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"time"
 	"unicode/utf8"
-
-	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/packages/param"
 )
 
-// conversation is the per-conv state hearsay tracks.  The SDK holds
-// the full message history server-side; we just track metadata for
-// listing / idle-reaping / cap enforcement.
+// conversation is the per-conv state hearsay tracks.  After PR C's
+// subprocess pivot, the canonical record of every conversation lives
+// on disk as a Claude Code session JSONL at
+// `<dataDir>/projects/<encoded-cwd>/<convID>.jsonl`; this struct is
+// metadata only.
 type conversation struct {
 	mu sync.Mutex // serializes turns within this conversation
 
 	convID         ConvID
-	sessionID      string
+	started        bool // true after the first SendMessage; toggles --session-id → --resume
 	startedAt      time.Time
 	lastActivityAt time.Time
 	turnCount      int
 	perTurnBudget  Budget
 	project        string
+	systemPrompt   string // full system prompt; first SendMessage passes it via --system-prompt
 
-	// Both previews are stored at start time so listing is cheap.
-	// firstUserPreview is filled on the first SendMessage; until then
-	// systemPreview is what list_peer_conversations surfaces.
 	systemPreview    string
 	firstUserPreview string
 
-	ended        bool
-	endedReason  EndReason
-	endedAt      time.Time
+	ended       bool
+	endedReason EndReason
+	endedAt     time.Time
 }
 
-// startConversation registers a new SDK session against the cached
-// agent + environment, allocates a conversation slot, and returns
-// the metadata three-tuple.  Refuses if --max-conversations is full.
-func (a *sdkAgent) StartConversation(ctx context.Context, req StartReq) (ConvID, time.Time, Budget, error) {
-	if err := a.ensureInit(ctx); err != nil {
-		return "", time.Time{}, Budget{}, fmt.Errorf("ensureInit: %w", err)
-	}
-
+// StartConversation allocates a UUID + slot, records the system
+// prompt, and returns.  No subprocess is spawned here — Claude Code
+// creates the on-disk JSONL lazily on the first --print call against
+// the convID (variant 2 of the argv contract).
+func (a *cliAgent) StartConversation(ctx context.Context, req StartReq) (ConvID, time.Time, Budget, error) {
 	project := a.resolveProject(req.Project)
 	if project == "" && req.Project != "" {
-		// req.Project was explicitly set but invalid.
 		return "", time.Time{}, Budget{}, fmt.Errorf("%w: %q", errInvalidProject, req.Project)
 	}
 
@@ -60,23 +54,16 @@ func (a *sdkAgent) StartConversation(ctx context.Context, req StartReq) (ConvID,
 	}
 	a.convsMu.Unlock()
 
-	sess, err := a.client.Beta.Sessions.New(ctx, anthropic.BetaSessionNewParams{
-		Agent:         anthropic.BetaSessionNewParamsAgentUnion{OfString: param.NewOpt(a.agentID)},
-		EnvironmentID: a.envID,
-	})
-	if err != nil {
-		return "", time.Time{}, Budget{}, fmt.Errorf("session create: %w", err)
-	}
-
+	convID := ConvID(newSessionUUID())
 	now := time.Now()
 	effective := req.Budget.Resolve(a.cfg.DefaultBudget)
 	conv := &conversation{
-		convID:         ConvID(sess.ID),
-		sessionID:      sess.ID,
+		convID:         convID,
 		startedAt:      now,
 		lastActivityAt: now,
 		perTurnBudget:  effective,
 		project:        project,
+		systemPrompt:   req.SystemPrompt,
 		systemPreview:  truncateRunes(req.SystemPrompt, 140),
 	}
 
@@ -84,16 +71,17 @@ func (a *sdkAgent) StartConversation(ctx context.Context, req StartReq) (ConvID,
 	if a.convs == nil {
 		a.convs = make(map[ConvID]*conversation)
 	}
-	a.convs[conv.convID] = conv
+	a.convs[convID] = conv
 	a.convsMu.Unlock()
 
-	return conv.convID, now, effective, nil
+	return convID, now, effective, nil
 }
 
 // SendMessage drives one more turn of an existing conversation.
-// Holds the conversation's own lock for the full turn so concurrent
-// callers serialize.
-func (a *sdkAgent) SendMessage(ctx context.Context, convID ConvID, prompt string, budget Budget) (Transcript, error) {
+// First-turn calls invoke `claude --print --session-id <conv.convID>
+// [--system-prompt <conv.systemPrompt>]`; subsequent turns invoke
+// `claude --print --resume <conv.convID>`.
+func (a *cliAgent) SendMessage(ctx context.Context, convID ConvID, prompt string, budget Budget) (Transcript, error) {
 	conv, err := a.lookupAlive(convID)
 	if err != nil {
 		return Transcript{}, err
@@ -103,8 +91,7 @@ func (a *sdkAgent) SendMessage(ctx context.Context, convID ConvID, prompt string
 	defer conv.mu.Unlock()
 
 	// Re-check liveness inside the lock so a mid-turn reap+restart
-	// race produces ErrConvReaped, not a confusing "session not found"
-	// from the SDK.
+	// race produces ErrConvReaped, not a confusing error from claude.
 	a.convsMu.Lock()
 	live, ok := a.convs[convID]
 	a.convsMu.Unlock()
@@ -125,12 +112,19 @@ func (a *sdkAgent) SendMessage(ctx context.Context, convID ConvID, prompt string
 	}
 	turnIndex := conv.turnCount
 
-	start := time.Now()
-	tx, invokes, _ := a.runTurn(ctx, conv, prompt, turnBudget)
-	tx.ElapsedMs = time.Since(start).Milliseconds()
-	tx.TurnCount = turnIndex // overall turn index, not per-call (the loop counts agent_messages within a turn)
-
+	tx, invokes, _ := a.runClaude(ctx, runReq{
+		conv:       conv,
+		prompt:     prompt,
+		budget:     turnBudget,
+		convStarted: conv.started,
+	})
 	conv.lastActivityAt = time.Now()
+	if !conv.started && tx.StopReason != StopReasonShutdown && tx.StopReason != StopReasonTimeout {
+		// Flip iff the subprocess actually ran; if we shut down or
+		// timed out before the subprocess could create the JSONL,
+		// the next attempt should re-include --system-prompt.
+		conv.started = true
+	}
 
 	if a.cfg.Auditor != nil {
 		_ = a.cfg.Auditor.Log(AuditEntry{
@@ -146,87 +140,13 @@ func (a *sdkAgent) SendMessage(ctx context.Context, convID ConvID, prompt string
 			ErrorSummary:  tx.ErrorSummary,
 		})
 	}
-
+	tx.TurnCount = turnIndex
 	return tx, nil
-}
-
-// runTurn is the shared SDK round-trip used by both SendMessage and
-// (the reused-from-PR-A) OneShot path.  Sends one user.message,
-// drains events through runEventLoop, returns the assembled
-// Transcript.
-func (a *sdkAgent) runTurn(
-	ctx context.Context,
-	conv *conversation,
-	prompt string,
-	budget Budget,
-) (Transcript, []AuditToolInvoke, error) {
-	if _, err := a.client.Beta.Sessions.Events.Send(ctx, conv.sessionID, anthropic.BetaSessionEventSendParams{
-		Events: []anthropic.BetaManagedAgentsEventParamsUnion{
-			{
-				OfUserMessage: &anthropic.BetaManagedAgentsUserMessageEventParams{
-					Type: anthropic.BetaManagedAgentsUserMessageEventParamsTypeUserMessage,
-					Content: []anthropic.BetaManagedAgentsUserMessageEventParamsContentUnion{
-						{OfText: &anthropic.BetaManagedAgentsTextBlockParam{Text: prompt}},
-					},
-				},
-			},
-		},
-	}); err != nil {
-		return Transcript{
-			Markdown:     fmt.Sprintf("_failed to send user message: %s_\n", err.Error()),
-			StopReason:   StopReasonError,
-			ErrorSummary: classifyErrorMsg(err.Error()),
-		}, nil, nil
-	}
-
-	stream := a.client.Beta.Sessions.Events.StreamEvents(ctx, conv.sessionID, anthropic.BetaSessionEventStreamParams{})
-	defer stream.Close()
-
-	events := make(chan LoopEvent, 32)
-	go a.pumpStream(ctx, stream, events)
-
-	allow := make(map[string]bool, len(AllowedToolNames))
-	for _, n := range AllowedToolNames {
-		allow[n] = true
-	}
-
-	hooks := LoopHooks{
-		ExecuteTool: func(name string, input json.RawMessage) (string, error) {
-			handler, ok := customToolHandlers[name]
-			if !ok {
-				return "", fmt.Errorf("no handler for tool %q", name)
-			}
-			var args map[string]any
-			if err := json.Unmarshal(input, &args); err != nil {
-				return "", fmt.Errorf("decode args: %w", err)
-			}
-			return handler(args, conv.project)
-		},
-		SendToolResult: func(toolUseID, content string, isError bool) error {
-			_, err := a.client.Beta.Sessions.Events.Send(ctx, conv.sessionID, anthropic.BetaSessionEventSendParams{
-				Events: []anthropic.BetaManagedAgentsEventParamsUnion{
-					{
-						OfUserCustomToolResult: &anthropic.BetaManagedAgentsUserCustomToolResultEventParams{
-							Type:            anthropic.BetaManagedAgentsUserCustomToolResultEventParamsTypeUserCustomToolResult,
-							CustomToolUseID: toolUseID,
-							Content: []anthropic.BetaManagedAgentsUserCustomToolResultEventParamsContentUnion{
-								{OfText: &anthropic.BetaManagedAgentsTextBlockParam{Text: content}},
-							},
-							IsError: param.NewOpt(isError),
-						},
-					},
-				},
-			})
-			return err
-		},
-	}
-
-	return runEventLoop(ctx, events, hooks, budget, allow)
 }
 
 // ListConversations returns the metadata view of every alive
 // conversation, sorted by lastActivityAt desc.
-func (a *sdkAgent) ListConversations() []ConvMeta {
+func (a *cliAgent) ListConversations() []ConvMeta {
 	a.convsMu.Lock()
 	defer a.convsMu.Unlock()
 
@@ -253,11 +173,10 @@ func (a *sdkAgent) ListConversations() []ConvMeta {
 	return out
 }
 
-// EndConversation terminates a conversation.  Idempotent: a second
-// call with the same convID returns AlreadyEnded=true rather than an
-// error.  Calls Beta.Sessions.Delete server-side so we don't leak
-// a phantom session.
-func (a *sdkAgent) EndConversation(ctx context.Context, convID ConvID, reason EndReason) (EndSummary, error) {
+// EndConversation marks the conv slot ended.  No upstream call —
+// Claude Code's session JSONL stays on disk so Phase-1 read_session
+// can still surface it.  Idempotent: re-end returns AlreadyEnded.
+func (a *cliAgent) EndConversation(ctx context.Context, convID ConvID, reason EndReason) (EndSummary, error) {
 	a.convsMu.Lock()
 	conv, ok := a.convs[convID]
 	a.convsMu.Unlock()
@@ -280,13 +199,7 @@ func (a *sdkAgent) EndConversation(ctx context.Context, convID ConvID, reason En
 	conv.endedReason = reason
 	conv.endedAt = time.Now()
 	totalTurns := conv.turnCount
-	sessionID := conv.sessionID
 	conv.mu.Unlock()
-
-	// Best-effort server-side delete.  Failure here doesn't roll
-	// back local state — the operator probably wants the local map
-	// to reflect intent even if the upstream call failed.
-	_, _ = a.client.Beta.Sessions.Delete(ctx, sessionID, anthropic.BetaSessionDeleteParams{})
 
 	return EndSummary{
 		Ended:        true,
@@ -297,9 +210,9 @@ func (a *sdkAgent) EndConversation(ctx context.Context, convID ConvID, reason En
 }
 
 // lookupAlive returns the conversation iff it exists and hasn't been
-// ended.  Returns ErrUnknownConv on miss, ErrConvReaped if the conv
-// was already terminated by the idle reaper.
-func (a *sdkAgent) lookupAlive(convID ConvID) (*conversation, error) {
+// ended.  Returns ErrUnknownConv on miss / caller-ended; ErrConvReaped
+// if the idle reaper terminated it.
+func (a *cliAgent) lookupAlive(convID ConvID) (*conversation, error) {
 	a.convsMu.Lock()
 	conv, ok := a.convs[convID]
 	a.convsMu.Unlock()
@@ -321,7 +234,7 @@ func (a *sdkAgent) lookupAlive(convID ConvID) (*conversation, error) {
 
 // aliveCountLocked counts non-ended conversations.  Caller MUST hold
 // a.convsMu.
-func (a *sdkAgent) aliveCountLocked() int {
+func (a *cliAgent) aliveCountLocked() int {
 	count := 0
 	for _, c := range a.convs {
 		if !c.ended {
@@ -331,10 +244,8 @@ func (a *sdkAgent) aliveCountLocked() int {
 	return count
 }
 
-// startReaper launches the background idle-reaper.  Closing
-// a.reaperStop stops it; a.reaperDone is signaled when the goroutine
-// has fully exited.
-func (a *sdkAgent) startReaper() {
+// startReaper launches the background idle-reaper.
+func (a *cliAgent) startReaper() {
 	if a.cfg.ConversationIdleTimeout <= 0 {
 		return
 	}
@@ -343,11 +254,9 @@ func (a *sdkAgent) startReaper() {
 	go a.reapLoop()
 }
 
-func (a *sdkAgent) reapLoop() {
+func (a *cliAgent) reapLoop() {
 	defer close(a.reaperDone)
 
-	// Tick at 1/4 the idle timeout so we don't reap N seconds late;
-	// floor at 1s so very short configured timeouts don't spin.
 	interval := a.cfg.ConversationIdleTimeout / 4
 	if interval < time.Second {
 		interval = time.Second
@@ -366,39 +275,30 @@ func (a *sdkAgent) reapLoop() {
 }
 
 // reapStaleConversations marks any conversation whose lastActivityAt
-// is older than --conversation-idle-timeout as ended (with reason
-// "idle_timeout") and best-effort-deletes the upstream session.
-func (a *sdkAgent) reapStaleConversations() {
+// is older than --conversation-idle-timeout as ended.  No upstream
+// delete — the JSONL stays on disk for Phase-1 read_session.
+func (a *cliAgent) reapStaleConversations() {
 	cutoff := time.Now().Add(-a.cfg.ConversationIdleTimeout)
-	var toDelete []string
-
 	a.convsMu.Lock()
+	defer a.convsMu.Unlock()
 	for _, conv := range a.convs {
 		conv.mu.Lock()
 		if !conv.ended && conv.lastActivityAt.Before(cutoff) {
 			conv.ended = true
 			conv.endedReason = EndedByIdleReap
 			conv.endedAt = time.Now()
-			toDelete = append(toDelete, conv.sessionID)
 		}
 		conv.mu.Unlock()
-	}
-	a.convsMu.Unlock()
-
-	for _, sessionID := range toDelete {
-		_, _ = a.client.Beta.Sessions.Delete(context.Background(), sessionID, anthropic.BetaSessionDeleteParams{})
 	}
 }
 
 // stopReaper signals the reaper goroutine to exit and waits for it.
-// Safe to call multiple times.
-func (a *sdkAgent) stopReaper() {
+func (a *cliAgent) stopReaper() {
 	if a.reaperStop == nil {
 		return
 	}
 	select {
 	case <-a.reaperStop:
-		// Already closed.
 	default:
 		close(a.reaperStop)
 	}
@@ -408,7 +308,7 @@ func (a *sdkAgent) stopReaper() {
 }
 
 // truncateRunes returns the first n runes of s as a new string.
-// UTF-8 safe — it iterates by rune so a multi-byte codepoint at the
+// UTF-8 safe — iterates by rune so a multi-byte codepoint at the
 // boundary doesn't yield invalid UTF-8 in the output.
 func truncateRunes(s string, n int) string {
 	if utf8.RuneCountInString(s) <= n {
@@ -424,7 +324,41 @@ func truncateRunes(s string, n int) string {
 	return s
 }
 
-// errInvalidProject is the typed sentinel the StartConversation /
-// OneShot paths return when the caller passes an invalid project arg.
-// Wrapped with %w in the actual error so callers can errors.Is it.
+// resolveProject implements the OneShotRequest/StartReq Project rules:
+//
+//  1. If req.Project is non-empty AND points at an existing dir, use it.
+//  2. If req.Project is non-empty but invalid, return "" (caller surfaces invalid_project).
+//  3. If req.Project is empty, use FallbackProject (set to os.Getwd() at construction).
+func (a *cliAgent) resolveProject(p string) string {
+	if p == "" {
+		return a.cfg.FallbackProject
+	}
+	info, err := os.Stat(p)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+	return p
+}
+
+// errInvalidProject is the typed sentinel for invalid req.Project.
 var errInvalidProject = errors.New("invalid project")
+
+// newSessionUUID returns a random UUIDv4 string.  Used as the convID
+// for new conversations and as the --session-id argv argument.
+//
+// We don't import a UUID library — this is a 16-byte random buffer
+// formatted into the standard 8-4-4-4-12 hex layout with the
+// version/variant bits set per RFC 4122.
+func newSessionUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failure is essentially fatal on every
+		// platform we ship to; falling back to a fixed UUID would
+		// silently corrupt the conv map.  Panic so the operator
+		// notices.
+		panic(fmt.Sprintf("agent: crypto/rand failed: %v", err))
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}

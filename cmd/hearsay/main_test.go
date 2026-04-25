@@ -733,45 +733,16 @@ func TestRunServer_RegenerateTokenBranch(t *testing.T) {
 	<-done
 }
 
-// TestRunServer_EnableAgentRefusesWithoutAPIKey is the load-bearing
-// guard from the plan's error contract: hearsay must refuse to start
-// (no half-configured state) when --enable-agent is set but the API
-// key env is empty.
-func TestRunServer_EnableAgentRefusesWithoutAPIKey(t *testing.T) {
+// TestRunServer_EnableAgentRefusesWithoutClaudeBin is the load-bearing
+// startup-validation guard: --enable-agent set + `claude` not on PATH ⇒
+// non-zero exit + friendly error mentioning `claude` and
+// `--agent-claude-bin`.
+func TestRunServer_EnableAgentRefusesWithoutClaudeBin(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", "")
-	t.Setenv("ANTHROPIC_API_KEY", "")
-
-	stderrCapture := captureStderr(t, func() {
-		// runServerWithSignals exits before binding when init fails;
-		// pre-fill sigCh so the (unused) shutdown branch can't deadlock.
-		sigCh := make(chan os.Signal, 1)
-		sigCh <- syscall.SIGTERM
-		code := runServerWithSignals([]string{
-			"--name", "ivan",
-			"--bind", "127.0.0.1",
-			"--port", "0",
-			"--quiet",
-			"--enable-agent",
-		}, sigCh)
-		if code == 0 {
-			t.Errorf("expected non-zero exit when --enable-agent and key is empty")
-		}
-	})
-	if !strings.Contains(stderrCapture, "ANTHROPIC_API_KEY") {
-		t.Errorf("expected error mentioning ANTHROPIC_API_KEY; got: %s", stderrCapture)
-	}
-}
-
-// TestRunServer_EnableAgentCustomKeyEnv exercises the --agent-api-key-env
-// override branch.  We point the flag at a non-default env var name and
-// confirm the *missing* var causes the same refusal.
-func TestRunServer_EnableAgentCustomKeyEnv(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", "")
-	t.Setenv("HEARSAY_TEST_KEY_DOES_NOT_EXIST", "")
+	// Strip PATH so claude can't be resolved.
+	t.Setenv("PATH", "")
 
 	stderrCapture := captureStderr(t, func() {
 		sigCh := make(chan os.Signal, 1)
@@ -782,32 +753,103 @@ func TestRunServer_EnableAgentCustomKeyEnv(t *testing.T) {
 			"--port", "0",
 			"--quiet",
 			"--enable-agent",
-			"--agent-api-key-env", "HEARSAY_TEST_KEY_DOES_NOT_EXIST",
 		}, sigCh)
 		if code == 0 {
-			t.Errorf("expected non-zero exit")
+			t.Errorf("expected non-zero exit when --enable-agent and claude is unfindable")
 		}
 	})
-	if !strings.Contains(stderrCapture, "HEARSAY_TEST_KEY_DOES_NOT_EXIST") {
-		t.Errorf("expected error mentioning the override env var; got: %s", stderrCapture)
+	if !strings.Contains(stderrCapture, "claude") || !strings.Contains(stderrCapture, "--agent-claude-bin") {
+		t.Errorf("expected error mentioning claude + --agent-claude-bin; got: %s", stderrCapture)
 	}
 }
 
-// TestMaskKey covers the rendering used in startup-log key masking.
-func TestMaskKey(t *testing.T) {
-	cases := []struct {
-		in   string
+// TestRunServer_EnableAgentAcceptsOverridePath exercises the
+// --agent-claude-bin override.  We write a fake `claude` shell script
+// (so the path exists and is executable), point hearsay at it, and
+// confirm the binary starts up cleanly.
+func TestRunServer_EnableAgentAcceptsOverridePath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "fake-claude")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("fake claude: %v", err)
+	}
+
+	port, err := freePort()
+	if err != nil {
+		t.Fatalf("free port: %v", err)
+	}
+	sigCh := make(chan os.Signal, 1)
+	done := make(chan int, 1)
+	go func() {
+		done <- runServerWithSignals([]string{
+			"--name", "ivan",
+			"--bind", "127.0.0.1",
+			"--port", fmt.Sprint(port),
+			"--regenerate-token",
+			"--data-dir", t.TempDir(),
+			"--quiet",
+			"--enable-agent",
+			"--agent-claude-bin", stub,
+		}, sigCh)
+	}()
+	time.Sleep(200 * time.Millisecond)
+	sigCh <- syscall.SIGTERM
+	if code := <-done; code != 0 {
+		t.Errorf("expected clean shutdown, got exit %d", code)
+	}
+}
+
+// TestRunServer_HardFailsOnRemovedFlags confirms the v0.3 deprecation
+// hard-fail path for the three removed flags.
+func TestRunServer_HardFailsOnRemovedFlags(t *testing.T) {
+	for _, removed := range []struct {
+		name string
+		args []string
 		want string
 	}{
-		{"", "***"},
-		{"sk-ant", "***"},
-		{"sk-ant-x12345abcd", "sk-ant-....abcd"},
+		{"--agent-api-key-env", []string{"--agent-api-key-env", "FOO"}, "--agent-api-key-env"},
+		{"--agent-base-url", []string{"--agent-base-url", "http://x"}, "--agent-base-url"},
+		{"--agent-model", []string{"--agent-model", "claude-haiku"}, "--agent-model"},
+	} {
+		t.Run(removed.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", "")
+
+			stderrCapture := captureStderr(t, func() {
+				sigCh := make(chan os.Signal, 1)
+				sigCh <- syscall.SIGTERM
+				args := append([]string{
+					"--name", "ivan",
+					"--bind", "127.0.0.1",
+					"--port", "0",
+					"--quiet",
+					"--enable-agent",
+				}, removed.args...)
+				code := runServerWithSignals(args, sigCh)
+				if code == 0 {
+					t.Errorf("expected non-zero exit on %s", removed.name)
+				}
+			})
+			if !strings.Contains(stderrCapture, removed.want) ||
+				!strings.Contains(stderrCapture, "removed in v0.3") {
+				t.Errorf("expected hard-fail message naming %s; got: %s", removed.name, stderrCapture)
+			}
+		})
 	}
-	for _, c := range cases {
-		if got := maskKey(c.in); got != c.want {
-			t.Errorf("maskKey(%q) = %q, want %q", c.in, got, c.want)
-		}
+}
+
+func freePort() (int, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
 	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port, nil
 }
 
 // runInvite with a fake tailscale on PATH exercises the tailscale DNS
