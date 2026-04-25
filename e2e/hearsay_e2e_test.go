@@ -651,6 +651,138 @@ func truncate(s string, n int) string {
 	return s[:n] + "…"
 }
 
+// startServerWithEnv launches hearsay with a custom environment slice
+// so callers can set ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL etc.  Same
+// shape as startServerAt; factored out so the agent-enabled path stays
+// readable.
+func startServerWithEnv(t *testing.T, name string, extraArgs []string, extraEnv []string) *fixture {
+	t.Helper()
+	home := t.TempDir()
+	dataDir := t.TempDir()
+	seedFakeSession(t, dataDir)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	args := append([]string{
+		"--name", name,
+		"--port", fmt.Sprint(port),
+		"--bind", "127.0.0.1",
+		"--data-dir", dataDir,
+	}, extraArgs...)
+	stderrBuf := &strings.Builder{}
+	cmd := exec.Command(binaryPath, args...)
+	cmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"XDG_CONFIG_HOME=",
+	)
+	cmd.Env = append(cmd.Env, extraEnv...)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = &teeWriter{dst: stderrBuf}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start hearsay: %v", err)
+	}
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	waitForHealth(t, baseURL, 5*time.Second)
+
+	shutdown := func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+		}
+		_ = cmd.Wait()
+	}
+	t.Cleanup(shutdown)
+	return &fixture{
+		t:        t,
+		home:     home,
+		dataDir:  dataDir,
+		port:     port,
+		baseURL:  baseURL,
+		token:    readToken(t, home),
+		stderr:   stderrBuf,
+		cmd:      cmd,
+		shutdown: shutdown,
+	}
+}
+
+// TestE2E_AgentToolAbsentWhenDisabled confirms the off-by-default
+// gating: a Phase-1 install upgrading to a v0.2 binary without
+// --enable-agent sees the same 8-tool surface as before.
+func TestE2E_AgentToolAbsentWhenDisabled(t *testing.T) {
+	f := startServer(t, "agent-off")
+	cs := f.connectMCP(t)
+	for tool := range cs.Tools(context.Background(), nil) {
+		if tool.Name == "ask_peer_claude" {
+			t.Errorf("ask_peer_claude must NOT be registered when --enable-agent is absent")
+		}
+	}
+}
+
+// TestE2E_AgentToolPresentWhenEnabled confirms the positive: with
+// --enable-agent and a (dummy) API key, ask_peer_claude is registered
+// and its description carries the routing-disambiguation language.
+func TestE2E_AgentToolPresentWhenEnabled(t *testing.T) {
+	f := startServerWithEnv(t, "agent-on",
+		[]string{"--enable-agent", "--quiet"},
+		[]string{
+			"ANTHROPIC_API_KEY=sk-ant-fake-test-key-12345",
+			// agent.New does NOT call out to Anthropic at construction
+			// time — the API key is just cached.  Lazy Environment+Agent
+			// creation happens on first OneShot call, which we don't
+			// trigger in this test.
+		},
+	)
+	cs := f.connectMCP(t)
+	found := false
+	for tool := range cs.Tools(context.Background(), nil) {
+		if tool.Name == "ask_peer_claude" {
+			found = true
+			if !strings.Contains(tool.Description, "parallel Claude session") {
+				t.Errorf("description must include disambiguation language; got %q", tool.Description)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("ask_peer_claude not in tool catalog")
+	}
+}
+
+// TestE2E_AgentRefusesStartWithoutKey confirms the error-contract row:
+// `--enable-agent` set but ANTHROPIC_API_KEY empty ⇒ refuse to start.
+// We can't use startServerWithEnv (it waits for /health) — the binary
+// is supposed to exit before binding.  Drive `exec.Cmd` directly.
+func TestE2E_AgentRefusesStartWithoutKey(t *testing.T) {
+	home := t.TempDir()
+	dataDir := t.TempDir()
+	cmd := exec.Command(binaryPath,
+		"--name", "agent-noenv",
+		"--port", "0",
+		"--bind", "127.0.0.1",
+		"--data-dir", dataDir,
+		"--enable-agent",
+		"--quiet",
+	)
+	cmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"XDG_CONFIG_HOME=",
+		"ANTHROPIC_API_KEY=",
+	)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	cmd.Stdout = io.Discard
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("expected hearsay --enable-agent to fail without a key; stderr was: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "ANTHROPIC_API_KEY") {
+		t.Errorf("stderr should mention ANTHROPIC_API_KEY; got: %s", stderr.String())
+	}
+}
+
 // `hearsay pair` shells out to `claude mcp add`. We stub `claude` with
 // a script that records its argv so we can confirm the invocation was
 // shaped correctly. Sidesteps needing real Claude Code on the CI runner.

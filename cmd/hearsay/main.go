@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/WiktorStarczewski/hearsay/internal/agent"
 	"github.com/WiktorStarczewski/hearsay/internal/claudemd"
 	"github.com/WiktorStarczewski/hearsay/internal/config"
 	"github.com/WiktorStarczewski/hearsay/internal/server"
@@ -101,6 +102,17 @@ SERVER FLAGS
   --regenerate-token        rotate the stored bearer token and print it
   --quiet                   suppress tool-call logs
 
+PHASE-2 AGENT FLAGS (off by default)
+  --enable-agent            register interactive tools (ask_peer_claude, …)
+  --agent-api-key-env <NM>  env var the Anthropic API key is read from (default ANTHROPIC_API_KEY)
+  --agent-base-url <url>    override Anthropic API base URL (test stubs / regional endpoints)
+  --agent-model <id>        override the Anthropic model id (default claude-opus-4-7)
+  --agent-default-max-tokens <n>        per-turn token budget (default 32768)
+  --agent-default-max-tool-calls <n>    per-turn tool-call budget (default 20)
+  --agent-default-timeout-seconds <n>   per-call wall-clock budget in seconds (default 120)
+  --agent-log-path <path>   audit log (default: ~/Library/Logs/hearsay/agent.log on macOS,
+                            $XDG_STATE_HOME/hearsay/agent.log elsewhere)
+
 ADD-PEER FLAGS
   --url <url>               peer's hearsay MCP URL (e.g. http://ivan-mac.tailXXXX.ts.net:3456/mcp)
   --token <token>           bearer token the peer issued
@@ -129,13 +141,25 @@ func runServer(args []string) int {
 func runServerWithSignals(args []string, sigCh <-chan os.Signal) int {
 	fs := flag.NewFlagSet("hearsay", flag.ContinueOnError)
 	var (
-		name             = fs.String("name", "", "peer identity (required on first run)")
-		port             = fs.Int("port", 3456, "listen port")
-		bind             = fs.String("bind", "", "bind address (default: tailscale IPv4, else 127.0.0.1)")
-		dataDir          = fs.String("data-dir", "", "Claude Code data dir (default ~/.claude)")
-		liveWindowSecs   = fs.Int("live-window-seconds", 300, "isLive threshold")
-		regenerateToken  = fs.Bool("regenerate-token", false, "rotate the stored bearer token")
-		quiet            = fs.Bool("quiet", false, "suppress tool-call logs")
+		name            = fs.String("name", "", "peer identity (required on first run)")
+		port            = fs.Int("port", 3456, "listen port")
+		bind            = fs.String("bind", "", "bind address (default: tailscale IPv4, else 127.0.0.1)")
+		dataDir         = fs.String("data-dir", "", "Claude Code data dir (default ~/.claude)")
+		liveWindowSecs  = fs.Int("live-window-seconds", 300, "isLive threshold")
+		regenerateToken = fs.Bool("regenerate-token", false, "rotate the stored bearer token")
+		quiet           = fs.Bool("quiet", false, "suppress tool-call logs")
+
+		// --- Phase-2 agent flags. All gated by --enable-agent; off by
+		// default so a Phase-1 install upgrading to a v0.2 binary
+		// behaves bit-for-bit like before until the operator opts in.
+		enableAgent     = fs.Bool("enable-agent", false, "enable Phase-2 interactive agent tools (ask_peer_claude, etc.)")
+		agentAPIKeyEnv  = fs.String("agent-api-key-env", "ANTHROPIC_API_KEY", "env var the Anthropic API key is read from")
+		agentBaseURL    = fs.String("agent-base-url", "", "override Anthropic API base URL (test stubs / regional endpoints)")
+		agentModel      = fs.String("agent-model", "", "override the Anthropic model id (default claude-opus-4-7)")
+		agentMaxTokens  = fs.Int("agent-default-max-tokens", 32768, "default per-turn max_tokens budget")
+		agentMaxTools   = fs.Int("agent-default-max-tool-calls", 20, "default per-turn max_tool_calls budget")
+		agentTimeoutSec = fs.Int("agent-default-timeout-seconds", 120, "default per-call wall-clock budget in seconds")
+		agentLogPath    = fs.String("agent-log-path", "", "audit-log path (default: platform-specific — see DefaultAuditPath)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -149,6 +173,47 @@ func runServerWithSignals(args []string, sigCh <-chan os.Signal) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hearsay: %v\n", err)
 		return 1
+	}
+
+	// If --enable-agent was set, we MUST have an API key before we bind
+	// the listener; refusing to start avoids a half-configured server
+	// where ask_peer_claude is registered but every call fails.
+	var ag agent.Agent
+	if *enableAgent {
+		envName := *agentAPIKeyEnv
+		key := os.Getenv(envName)
+		if key == "" {
+			fmt.Fprintf(os.Stderr,
+				"hearsay: --enable-agent set but %s is empty (override the env var name with --agent-api-key-env)\n",
+				envName)
+			return 1
+		}
+		auditPath := *agentLogPath
+		if auditPath == "" {
+			auditPath = agent.DefaultAuditPath()
+		}
+		auditor, err := agent.NewAuditor(auditPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "hearsay: agent audit log: %v\n", err)
+			return 1
+		}
+		ag, err = agent.New(agent.Config{
+			APIKey:   key,
+			BaseURL:  *agentBaseURL,
+			Model:    *agentModel,
+			PeerName: resolved.Config.Name,
+			DefaultBudget: agent.Budget{
+				MaxTokens:    *agentMaxTokens,
+				MaxToolCalls: *agentMaxTools,
+				Timeout:      time.Duration(*agentTimeoutSec) * time.Second,
+			},
+			Auditor: auditor,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "hearsay: agent init: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "agent enabled (key: %s)  audit log: %s\n", maskKey(key), auditPath)
 	}
 
 	effectiveBind := *bind
@@ -172,6 +237,7 @@ func runServerWithSignals(args []string, sigCh <-chan os.Signal) int {
 		DataDir:     *dataDir,
 		LiveWindow:  time.Duration(*liveWindowSecs) * time.Second,
 		Quiet:       *quiet,
+		Agent:       ag,
 	})
 	if err != nil {
 		if isAddrInUse(err) {
@@ -201,6 +267,17 @@ func runServerWithSignals(args []string, sigCh <-chan os.Signal) int {
 		return 1
 	}
 	return 0
+}
+
+// maskKey returns a privacy-safe rendering of an Anthropic API key for
+// startup logs.  Shows the first few chars + last four of the key so
+// the operator can identify which key is loaded without leaking the
+// secret in case the log file is shared.
+func maskKey(k string) string {
+	if len(k) <= 12 {
+		return "***"
+	}
+	return k[:7] + "...." + k[len(k)-4:]
 }
 
 // isAddrInUse treats EADDRINUSE specially so the operator gets a

@@ -16,18 +16,24 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/WiktorStarczewski/hearsay/internal/agent"
 	"github.com/WiktorStarczewski/hearsay/internal/tools"
 )
 
 type Options struct {
-	Port         int
-	Bind         string
-	Token        string
-	PeerName     string
-	PeerVersion  string
-	DataDir      string
-	LiveWindow   time.Duration
-	Quiet        bool
+	Port        int
+	Bind        string
+	Token       string
+	PeerName    string
+	PeerVersion string
+	DataDir     string
+	LiveWindow  time.Duration
+	Quiet       bool
+
+	// Agent is non-nil iff `--enable-agent` was set.  When nil, the
+	// Phase-2 agent tools (ask_peer_claude, etc.) are not registered
+	// and the existing 8 read-only tools are the entire surface.
+	Agent agent.Agent
 }
 
 // Instance is a running hearsay server; Shutdown() gracefully stops it.
@@ -111,6 +117,7 @@ func buildMCP(opts Options) *mcp.Server {
 		DataDir:     opts.DataDir,
 		LiveWindow:  opts.LiveWindow,
 		Log:         logFn,
+		Agent:       opts.Agent,
 	})
 	return mcpSrv
 }
