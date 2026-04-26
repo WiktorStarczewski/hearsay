@@ -343,3 +343,7 @@ Agent flags (off by default; require --enable-agent):
 - **Single MCP surface.** Agent tools register alongside the read-only transcript tools on the same `mcp.Server` instance. Tailnet binding, bearer token, claude-md discoverability, and the rest of the operational story are unchanged whether `--enable-agent` is on or off.
 - **`claude` is the only runtime dependency.** Hearsay imports just `github.com/modelcontextprotocol/go-sdk` and a handful of stdlib-adjacent helpers; everything else routes through the spawned Claude Code subprocess.
 
+## License
+
+MIT — see [LICENSE](./LICENSE).
+
