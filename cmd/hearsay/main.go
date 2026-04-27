@@ -29,7 +29,7 @@ import (
 
 // version is overridable at build time via:
 //   go build -ldflags "-X main.version=<tag>" ./cmd/hearsay
-var version = "0.3.0-dev"
+var version = "0.3.1-dev"
 
 func main() {
 	os.Exit(dispatch(os.Args[1:]))
