@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -11,6 +12,25 @@ import (
 
 	"github.com/WiktorStarczewski/hearsay/internal/agent"
 )
+
+// assertEmptyStructuredContent fails the test if the result's
+// StructuredContent carries any field. The SDK may still emit `{}` (or
+// nil) for an empty struct, both of which are fine — anything richer
+// means the inlining regressed and we've reintroduced the metadata-only
+// rendering bug for consumers that prefer the structured channel.
+func assertEmptyStructuredContent(t *testing.T, res *mcp.CallToolResult) {
+	t.Helper()
+	if res == nil || res.StructuredContent == nil {
+		return
+	}
+	raw, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured: %v", err)
+	}
+	if s := string(raw); s != "{}" && s != "null" {
+		t.Errorf("StructuredContent must be empty so the markdown body is the source of truth; got %s", s)
+	}
+}
 
 // fakeAgent satisfies agent.Agent without touching the SDK.  Tests
 // inject canned Transcripts (or errors) so the tools layer's behavior
@@ -171,17 +191,50 @@ func TestAskPeerClaude_HappyPathReturnsMarkdownAndMetadata(t *testing.T) {
 		t.Fatalf("expected success, got isError=true: %+v", res.Content)
 	}
 	body := textOf(t, res.Content[0])
+	// Body must contain BOTH the header and the assistant text — the whole
+	// point of inlining is that consumers preferring StructuredContent still
+	// receive the response.
 	if !strings.Contains(body, "Found 3 errors") {
 		t.Errorf("transcript missing assistant body: %q", body)
 	}
-	var out AskPeerClaudeOutput
-	structuredDecode(t, res, &out)
-	if out.StopReason != string(agent.StopReasonEndTurn) {
-		t.Errorf("StopReason=%q", out.StopReason)
+	for _, want := range []string{
+		"turns=1",
+		"toolCalls=2",
+		"stopReason=" + string(agent.StopReasonEndTurn),
+		"elapsedMs=150",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metadata header missing %q in body: %q", want, body)
+		}
 	}
-	if out.ToolCallCount != 2 {
-		t.Errorf("ToolCallCount=%d", out.ToolCallCount)
+	// StructuredContent must be empty so consumers that prefer it don't end
+	// up with a metadata-only echo and no transcript.
+	assertEmptyStructuredContent(t, res)
+}
+
+// TestAskPeerClaude_BodySurvivesWhenStructuredPreferred is the explicit
+// regression for the "metadata-only response" bug: when an MCP consumer
+// renders only StructuredContent, the model still has to receive the
+// transcript. Inlining the header into the markdown plus emitting an empty
+// AskPeerClaudeOutput keeps the body the unconditional source of truth.
+func TestAskPeerClaude_BodySurvivesWhenStructuredPreferred(t *testing.T) {
+	ag := &fakeAgent{
+		respond: func(_ agent.OneShotRequest) (agent.Transcript, error) {
+			return agent.Transcript{
+				Markdown:   "the answer is 42",
+				TurnCount:  1,
+				StopReason: agent.StopReasonEndTurn,
+				ElapsedMs:  10,
+			}, nil
+		},
 	}
+	cs := connectAgentPair(t, ag)
+	res := callTool(t, cs, "ask_peer_claude", map[string]any{"prompt": "q"})
+	body := textOf(t, res.Content[0])
+	if !strings.Contains(body, "the answer is 42") {
+		t.Errorf("body must contain transcript even when consumer ignores StructuredContent; got %q", body)
+	}
+	assertEmptyStructuredContent(t, res)
 }
 
 func TestAskPeerClaude_PassesBudgetThrough(t *testing.T) {
@@ -234,10 +287,9 @@ func TestAskPeerClaude_FlagsErrorOnAgentReturnsError(t *testing.T) {
 	if !res.IsError {
 		t.Errorf("expected isError=true when agent reports stopReason=error")
 	}
-	var out AskPeerClaudeOutput
-	structuredDecode(t, res, &out)
-	if out.ErrorSummary != string(agent.ErrAPIUnavailable) {
-		t.Errorf("ErrorSummary=%q", out.ErrorSummary)
+	body := textOf(t, res.Content[0])
+	if !strings.Contains(body, "errorSummary="+string(agent.ErrAPIUnavailable)) {
+		t.Errorf("error summary missing from markdown header: %q", body)
 	}
 }
 
@@ -327,14 +379,16 @@ func TestSendPeerMessage_HappyPath(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("isError=true: %+v", res.Content)
 	}
-	if !strings.Contains(textOf(t, res.Content[0]), "turn 2 reply") {
-		t.Errorf("markdown missing body")
+	body := textOf(t, res.Content[0])
+	if !strings.Contains(body, "turn 2 reply") {
+		t.Errorf("markdown missing body: %q", body)
 	}
-	var out SendPeerMessageOutput
-	structuredDecode(t, res, &out)
-	if out.TurnCount != 2 || out.ToolCallCount != 1 {
-		t.Errorf("metadata wrong: %+v", out)
+	for _, want := range []string{"turns=2", "toolCalls=1"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metadata header missing %q in body: %q", want, body)
+		}
 	}
+	assertEmptyStructuredContent(t, res)
 	if ag.lastSendConv != "sess-42" || ag.lastSendBody != "follow up" {
 		t.Errorf("send args lost: conv=%q body=%q", ag.lastSendConv, ag.lastSendBody)
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -21,14 +22,51 @@ type AskPeerClaudeInput struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 
-// AskPeerClaudeOutput is the structured-content metadata that
-// accompanies the markdown transcript.
-type AskPeerClaudeOutput struct {
-	TurnCount     int    `json:"turnCount"`
-	ToolCallCount int    `json:"toolCallCount"`
-	StopReason    string `json:"stopReason"`
-	ElapsedMs     int64  `json:"elapsedMs"`
-	ErrorSummary  string `json:"errorSummary,omitempty"`
+// AskPeerClaudeOutput is intentionally empty.
+//
+// The earlier shape carried turnCount / toolCallCount / stopReason /
+// elapsedMs / errorSummary in StructuredContent alongside the markdown
+// transcript in Content. Some MCP consumers (notably Claude Code) surface
+// only the structured channel back to the calling model when both are
+// populated, dropping the markdown body — the calling Claude sees the
+// metadata footer but not the response. Mirroring the precedent set by
+// `read_tool_result`, the body is now the unconditional source of truth:
+// the metadata is inlined as a leading header line in the markdown,
+//
+//	[turns=N toolCalls=N stopReason=X elapsedMs=N]
+//
+//	<actual response>
+//
+// so it survives whichever channel the consumer prefers.
+type AskPeerClaudeOutput struct{}
+
+// transcriptHeaderLine renders the per-call metadata that used to ride
+// in StructuredContent into a single bracketed line. Keys mirror the old
+// JSON field names so callers parsing the transcript pick up the same
+// values without a translation table.
+func transcriptHeaderLine(tx agent.Transcript) string {
+	parts := []string{
+		fmt.Sprintf("turns=%d", tx.TurnCount),
+		fmt.Sprintf("toolCalls=%d", tx.ToolCallCount),
+		fmt.Sprintf("stopReason=%s", tx.StopReason),
+		fmt.Sprintf("elapsedMs=%d", tx.ElapsedMs),
+	}
+	if tx.ErrorSummary != "" {
+		parts = append(parts, fmt.Sprintf("errorSummary=%s", tx.ErrorSummary))
+	}
+	return "[" + strings.Join(parts, " ") + "]"
+}
+
+// withTranscriptHeader prepends transcriptHeaderLine + blank line to the
+// model's body. If the body is empty (e.g. the model emitted no text
+// because output_format=json swallowed it), the header alone still tells
+// the caller the call happened — preferable to a totally empty Content.
+func withTranscriptHeader(tx agent.Transcript) string {
+	header := transcriptHeaderLine(tx)
+	if tx.Markdown == "" {
+		return header + "\n"
+	}
+	return header + "\n\n" + tx.Markdown
 }
 
 func addAskPeerClaude(s *mcp.Server, ctx Context) {
@@ -62,18 +100,11 @@ func addAskPeerClaude(s *mcp.Server, ctx Context) {
 				return errResult("ask_peer_claude: " + err.Error()), AskPeerClaudeOutput{}, nil
 			}
 
-			out := AskPeerClaudeOutput{
-				TurnCount:     tx.TurnCount,
-				ToolCallCount: tx.ToolCallCount,
-				StopReason:    string(tx.StopReason),
-				ElapsedMs:     tx.ElapsedMs,
-				ErrorSummary:  string(tx.ErrorSummary),
-			}
 			result := &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: tx.Markdown}},
+				Content: []mcp.Content{&mcp.TextContent{Text: withTranscriptHeader(tx)}},
 				IsError: tx.StopReason == agent.StopReasonError,
 			}
-			return result, out, nil
+			return result, AskPeerClaudeOutput{}, nil
 		}))
 }
 
@@ -151,13 +182,10 @@ type SendPeerMessageInput struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 
-type SendPeerMessageOutput struct {
-	TurnCount     int    `json:"turnCount"`
-	ToolCallCount int    `json:"toolCallCount"`
-	StopReason    string `json:"stopReason"`
-	ElapsedMs     int64  `json:"elapsedMs"`
-	ErrorSummary  string `json:"errorSummary,omitempty"`
-}
+// SendPeerMessageOutput is intentionally empty for the same reason as
+// [AskPeerClaudeOutput] — see that comment for the rationale. The
+// per-turn metadata is inlined as a header line in the markdown.
+type SendPeerMessageOutput struct{}
 
 func addSendPeerMessage(s *mcp.Server, ctx Context) {
 	peer := capName(ctx.PeerName)
@@ -194,18 +222,11 @@ func addSendPeerMessage(s *mcp.Server, ctx Context) {
 				}
 			}
 
-			out := SendPeerMessageOutput{
-				TurnCount:     tx.TurnCount,
-				ToolCallCount: tx.ToolCallCount,
-				StopReason:    string(tx.StopReason),
-				ElapsedMs:     tx.ElapsedMs,
-				ErrorSummary:  string(tx.ErrorSummary),
-			}
 			result := &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: tx.Markdown}},
+				Content: []mcp.Content{&mcp.TextContent{Text: withTranscriptHeader(tx)}},
 				IsError: tx.StopReason == agent.StopReasonError,
 			}
-			return result, out, nil
+			return result, SendPeerMessageOutput{}, nil
 		}))
 }
 
