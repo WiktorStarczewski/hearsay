@@ -340,6 +340,12 @@ func TestReadSession_ReturnsMarkdownAndMetadata(t *testing.T) {
 	if meta.TotalTurns < 3 {
 		t.Errorf("totalTurns=%d, expected >= 3", meta.TotalTurns)
 	}
+	// Body must also reach the structured channel — same rendering rule
+	// as ask_peer_claude. Claude Code-class consumers render structured
+	// when present and drop the Content fallback.
+	if !strings.Contains(meta.Body, "hello hearsay") {
+		t.Errorf("StructuredContent.body missing first user message; got: %q", meta.Body)
+	}
 }
 
 func TestReadSession_JSONFormatOmitsMarkdown(t *testing.T) {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -22,51 +21,36 @@ type AskPeerClaudeInput struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 
-// AskPeerClaudeOutput is intentionally empty.
+// AskPeerClaudeOutput carries the model's response body alongside the
+// per-call metadata.
 //
-// The earlier shape carried turnCount / toolCallCount / stopReason /
-// elapsedMs / errorSummary in StructuredContent alongside the markdown
-// transcript in Content. Some MCP consumers (notably Claude Code) surface
-// only the structured channel back to the calling model when both are
-// populated, dropping the markdown body — the calling Claude sees the
-// metadata footer but not the response. Mirroring the precedent set by
-// `read_tool_result`, the body is now the unconditional source of truth:
-// the metadata is inlined as a leading header line in the markdown,
-//
-//	[turns=N toolCalls=N stopReason=X elapsedMs=N]
-//
-//	<actual response>
-//
-// so it survives whichever channel the consumer prefers.
-type AskPeerClaudeOutput struct{}
-
-// transcriptHeaderLine renders the per-call metadata that used to ride
-// in StructuredContent into a single bracketed line. Keys mirror the old
-// JSON field names so callers parsing the transcript pick up the same
-// values without a translation table.
-func transcriptHeaderLine(tx agent.Transcript) string {
-	parts := []string{
-		fmt.Sprintf("turns=%d", tx.TurnCount),
-		fmt.Sprintf("toolCalls=%d", tx.ToolCallCount),
-		fmt.Sprintf("stopReason=%s", tx.StopReason),
-		fmt.Sprintf("elapsedMs=%d", tx.ElapsedMs),
-	}
-	if tx.ErrorSummary != "" {
-		parts = append(parts, fmt.Sprintf("errorSummary=%s", tx.ErrorSummary))
-	}
-	return "[" + strings.Join(parts, " ") + "]"
+// The body lives in StructuredContent (this struct) AND in Content as a
+// fallback. Why both: PR #14 made StructuredContent empty on the theory
+// that consumers would fall back to Content — but Claude Code-class
+// clients render StructuredContent when present (even `{}`), silently
+// dropping Content. Putting the body into the structured channel makes
+// the response visible regardless of which channel the consumer prefers.
+type AskPeerClaudeOutput struct {
+	Body          string `json:"body,omitempty"`
+	TurnCount     int    `json:"turnCount,omitempty"`
+	ToolCallCount int    `json:"toolCallCount,omitempty"`
+	StopReason    string `json:"stopReason,omitempty"`
+	ElapsedMs     int64  `json:"elapsedMs,omitempty"`
+	ErrorSummary  string `json:"errorSummary,omitempty"`
 }
 
-// withTranscriptHeader prepends transcriptHeaderLine + blank line to the
-// model's body. If the body is empty (e.g. the model emitted no text
-// because output_format=json swallowed it), the header alone still tells
-// the caller the call happened — preferable to a totally empty Content.
-func withTranscriptHeader(tx agent.Transcript) string {
-	header := transcriptHeaderLine(tx)
-	if tx.Markdown == "" {
-		return header + "\n"
+// transcriptOutput packs a transcript into the structured shape.
+// Shared between ask_peer_claude and send_peer_message — both deliver a
+// model response with the same metadata footprint.
+func transcriptOutput(tx agent.Transcript) AskPeerClaudeOutput {
+	return AskPeerClaudeOutput{
+		Body:          tx.Markdown,
+		TurnCount:     tx.TurnCount,
+		ToolCallCount: tx.ToolCallCount,
+		StopReason:    string(tx.StopReason),
+		ElapsedMs:     tx.ElapsedMs,
+		ErrorSummary:  string(tx.ErrorSummary),
 	}
-	return header + "\n\n" + tx.Markdown
 }
 
 func addAskPeerClaude(s *mcp.Server, ctx Context) {
@@ -101,10 +85,10 @@ func addAskPeerClaude(s *mcp.Server, ctx Context) {
 			}
 
 			result := &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: withTranscriptHeader(tx)}},
+				Content: []mcp.Content{&mcp.TextContent{Text: tx.Markdown}},
 				IsError: tx.StopReason == agent.StopReasonError,
 			}
-			return result, AskPeerClaudeOutput{}, nil
+			return result, transcriptOutput(tx), nil
 		}))
 }
 
@@ -182,10 +166,10 @@ type SendPeerMessageInput struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 
-// SendPeerMessageOutput is intentionally empty for the same reason as
-// [AskPeerClaudeOutput] — see that comment for the rationale. The
-// per-turn metadata is inlined as a header line in the markdown.
-type SendPeerMessageOutput struct{}
+// SendPeerMessageOutput mirrors [AskPeerClaudeOutput]: per-turn body +
+// metadata in StructuredContent, body duplicated into Content as a
+// fallback. See the [AskPeerClaudeOutput] doc for the rationale.
+type SendPeerMessageOutput = AskPeerClaudeOutput
 
 func addSendPeerMessage(s *mcp.Server, ctx Context) {
 	peer := capName(ctx.PeerName)
@@ -223,10 +207,10 @@ func addSendPeerMessage(s *mcp.Server, ctx Context) {
 			}
 
 			result := &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: withTranscriptHeader(tx)}},
+				Content: []mcp.Content{&mcp.TextContent{Text: tx.Markdown}},
 				IsError: tx.StopReason == agent.StopReasonError,
 			}
-			return result, SendPeerMessageOutput{}, nil
+			return result, transcriptOutput(tx), nil
 		}))
 }
 

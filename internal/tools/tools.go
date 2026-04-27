@@ -203,6 +203,12 @@ type ReadSessionInput struct {
 }
 
 type ReadSessionOutput struct {
+	// Body holds the rendered markdown for format="full" (the default);
+	// it is omitted for format="json".  See the AskPeerClaudeOutput
+	// docstring for why the body lives in StructuredContent rather than
+	// only in Content — Claude Code-class clients render the structured
+	// channel and silently drop the Content channel when both exist.
+	Body            string `json:"body,omitempty"`
 	SessionID       string `json:"sessionId"`
 	TotalTurns      int    `json:"totalTurns"`
 	RenderedTurns   int    `json:"renderedTurns"`
@@ -239,7 +245,10 @@ func addReadSession(s *mcp.Server, ctx Context) {
 			if in.Format == "json" {
 				return nil, meta, nil
 			}
-			// Full format: markdown in Content, metadata as StructuredOutput.
+			// Full format: markdown in BOTH StructuredContent.Body and
+			// Content. The duplication is deliberate — see ReadSessionOutput
+			// docstring.
+			meta.Body = rendered.Markdown
 			result := &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: rendered.Markdown}},
 			}
